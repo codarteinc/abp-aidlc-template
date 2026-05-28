@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run shellcheck
+        run: shellcheck scaffold.sh lib/*.sh scripts/*.sh
+
+  bats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Run bats
+        run: |
+          if compgen -G 'tests/*.bats' > /dev/null; then
+            bats tests/
+          else
+            echo "no .bats files yet — unit-11 populates the smoke suite"
+          fi
+
+  token-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check overlay token coverage
+        run: ./scripts/check-token-coverage.sh
+
+  yaml-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install yamllint
+        run: pip install --user yamllint
+      - name: Run yamllint
+        run: |
+          ~/.local/bin/yamllint -d relaxed \
+            scaffold-config-schema.yml \
+            scaffold-config.example.yml \
+            .github/workflows/

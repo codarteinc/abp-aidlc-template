@@ -1,0 +1,103 @@
+# scaffold-config-schema.yml — single authoritative schema for the
+# scaffold tool's config files.
+#
+# Read by lib/validate-config.sh (validation) and by `scaffold.sh --help`
+# (flag enumeration). Each leaf node MUST declare `type` and `required`;
+# `enum`, `regex`, `default`, `default_from`, and `item_enum` are
+# optional refinements. `description` is informational only.
+#
+# Object nodes use `type: object` + a `fields:` map containing child
+# leaves (recursive). Arrays use `type: array` + optional `item_enum`.
+
+project_name:
+  type: string
+  required: true
+  regex: '^[A-Z][a-zA-Z0-9]+$'
+  description: "PascalCase project name; becomes the .NET root namespace and the GitHub repo name (lowercased)."
+
+github_owner:
+  type: string
+  required: true
+  regex: '^[A-Za-z0-9-]+$'
+  description: "GitHub user or org under which the scaffolded repo is created."
+
+hcp_org:
+  type: string
+  required: false
+  default_from: github_owner
+  description: "HCP Terraform org name; defaults to github_owner if unset."
+
+abp:
+  type: object
+  required: true
+  fields:
+    template:
+      type: string
+      required: false
+      enum: [app, app-nolayers, module, microservice]
+      default: app
+      description: "ABP solution template variant."
+    ui:
+      type: string
+      required: false
+      enum: [angular, mvc, blazor, blazor-server, none]
+      default: angular
+      description: "UI framework for the scaffolded app."
+    db_provider:
+      type: string
+      required: false
+      enum: [ef, mongodb]
+      default: ef
+      description: "Database access provider."
+    dbms:
+      type: string
+      required: false
+      enum: [postgresql, sqlserver, mysql, oracle, sqlite]
+      default: postgresql
+      description: "Database engine (relevant only when db_provider=ef)."
+    tiered:
+      type: bool
+      required: false
+      default: false
+      description: "Whether to use the tiered solution layout (separate AuthServer)."
+    multi_tenancy:
+      type: bool
+      required: false
+      default: false
+      description: "Enable ABP multi-tenancy features."
+    default_culture:
+      type: string
+      required: false
+      default: en
+      description: "Default localization culture (BCP-47 tag, e.g. en, pt-BR)."
+    optional_modules:
+      type: array
+      required: false
+      item_enum: [file-management, chat, audit-log-ui, language-management, text-template-management]
+      default: []
+      description: "Optional ABP commercial / open-source modules to wire in."
+
+infra:
+  type: object
+  required: true
+  fields:
+    hetzner_location:
+      type: string
+      required: false
+      default: hel1
+      description: "Hetzner Cloud region for staging."
+    hetzner_server_type:
+      type: string
+      required: false
+      default: cx22
+      description: "Hetzner Cloud server type for staging."
+    cloudflare_zone:
+      type: string
+      required: true
+      default: REPLACE_ME
+      description: "Cloudflare DNS zone hosting staging/prod hostnames. Use REPLACE_ME for the first scaffold run; bind a real zone before deploy."
+
+discord_webhook:
+  type: string
+  required: false
+  description: "Optional Discord webhook URL for deploy notifications. Workflows tolerate absence."

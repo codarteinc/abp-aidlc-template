@@ -1,0 +1,24 @@
+# scaffold-config.example.yml — worked-out example matching the
+# LinkHub-equivalent combo. Used by `--dry-run` smoke tests and CI.
+# Operators copy this to their own `my-app.yml` and tweak.
+
+project_name: SampleApp
+github_owner: codarteinc
+# hcp_org defaults to github_owner; left unset on purpose.
+
+abp:
+  template: app
+  ui: angular
+  db_provider: ef
+  dbms: postgresql
+  tiered: false
+  multi_tenancy: false
+  default_culture: en
+  optional_modules: []
+
+infra:
+  hetzner_location: hel1
+  hetzner_server_type: cx22
+  cloudflare_zone: example.com
+
+# discord_webhook left unset (optional).

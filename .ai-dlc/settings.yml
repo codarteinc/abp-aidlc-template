@@ -1,0 +1,21 @@
+# .ai-dlc/settings.yml — AI-DLC settings for this repo (the scaffold tool
+# itself eats its own dog food).
+
+git:
+  change_strategy: intent
+  default_branch: main
+  auto_merge: true
+  elaboration_review: true
+
+# Scaffold tool has no UI, so visual review is unused.
+visual_review: false
+
+default_passes:
+  - dev
+
+default_announcements:
+  - changelog
+
+providers:
+  ticketing:
+    type: github-issues

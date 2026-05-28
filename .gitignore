@@ -1,0 +1,20 @@
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Build / runtime artifacts
+.tmp/
+*.log
+tests/_tmp_*
+
+# Node / Python / .NET working dirs (in case overlay verification scratch lands here)
+node_modules/
+__pycache__/
+bin/
+obj/
+
+# Local scaffold-config drafts (operators may keep WIP configs here)
+*.local.yml
