@@ -38,7 +38,9 @@ source "${LIB_DIR}/prompt.sh"
 source "${LIB_DIR}/substitute.sh"
 
 # Total number of orchestration phases. Bump as unit-10 adds real bodies.
-STEP_TOTAL=11
+# 12 includes unit-05's phase_apply_security_overlay (inserted between
+# phase_apply_overlays and phase_run_post_init_commands).
+STEP_TOTAL=12
 STEP=0
 CURRENT_PHASE=""
 
@@ -690,6 +692,36 @@ phase_apply_overlays() {
     log_ok "overlay-dotnet applied"
 }
 
+phase_apply_security_overlay() {
+    _phase_start "phase_apply_security_overlay"
+
+    # Dry-run short-circuit — phase_apply_overlays produced no target tree
+    # under --dry-run / --dry-run-abp-new.
+    if (( DRY_RUN == 1 )) || (( DRY_RUN_ABP_NEW == 1 )); then
+        log_info "[overlay-security] dry-run: skipping security overlay (no rendered tree)"
+        return 0
+    fi
+
+    if [[ -z "${TARGET_DIR:-}" || ! -d "$TARGET_DIR" ]]; then
+        log_warn "[overlay-security] TARGET_DIR not set or missing; skipping"
+        return 0
+    fi
+
+    # shellcheck source=lib/security-overlay.sh
+    source "${LIB_DIR}/security-overlay.sh"
+
+    local target_real
+    target_real="$(realpath "$TARGET_DIR")"
+
+    security_overlay_insert_blocks "$target_real" || return 1
+    security_overlay_render_staging_secrets "$target_real" || return 1
+    security_overlay_install_cert_script "$target_real" || return 1
+    security_overlay_merge_dbmigrator_markers "$target_real" || return 1
+    security_overlay_append_gitignore "${target_real}/.gitignore" || return 1
+
+    log_ok "overlay-security applied"
+}
+
 phase_run_post_init_commands() {
     _phase_start "phase_run_post_init_commands (stub — unit-10)"
     log_info "post-init commands populate here in unit-10"
@@ -716,6 +748,7 @@ main() {
     phase_create_target_dir
     phase_abp_new
     phase_apply_overlays
+    phase_apply_security_overlay
     phase_run_post_init_commands
     phase_github_repo_init
     phase_handoff

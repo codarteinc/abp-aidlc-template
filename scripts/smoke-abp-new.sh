@@ -123,4 +123,68 @@ if ! grep -qF 'Include="OpenTelemetry.Extensions.Hosting"' "$host_csproj"; then
 fi
 echo "OK: observability surfaces present"
 
+# 5. Unit-05 security-overlay assertions (post `dotnet build`).
+echo "--- unit-05 security overlay assertions ---"
+project_root="$(dirname "$sln")"
+
+# 5a. CSP middleware file present + namespace token resolved.
+csp_mw="$(find "$project_root" -path '*/Middleware/ContentSecurityPolicyMiddleware.cs' | head -1)"
+if [[ -z "$csp_mw" ]]; then
+    echo "FAIL: ContentSecurityPolicyMiddleware.cs not found under $project_root" >&2
+    exit 1
+fi
+if grep -q '\${PROJECT_NAME}' "$csp_mw"; then
+    echo "FAIL: \${PROJECT_NAME} not substituted in $csp_mw" >&2
+    exit 1
+fi
+
+# 5b. Program.cs carries the production-fail-fast log line w/ substituted name.
+prog="$(find "$project_root" -path '*/HttpApi.Host/Program.cs' | head -1)"
+if ! grep -q '\[SmokeApp.Config\]' "$prog"; then
+    echo "FAIL: production-fail-fast block not present (or PROJECT_NAME unsub'd) in $prog" >&2
+    exit 1
+fi
+
+# 5c. appsettings.json has App:Csp:Mode == report-only.
+appsettings="$(find "$project_root" -path '*/HttpApi.Host/appsettings.json' | head -1)"
+if command -v jq >/dev/null; then
+    mode="$(jq -r '.App.Csp.Mode' "$appsettings")"
+    if [[ "$mode" != "report-only" ]]; then
+        echo "FAIL: App.Csp.Mode != 'report-only' (got '${mode}') in $appsettings" >&2
+        exit 1
+    fi
+fi
+
+# 5d. All 4 dev secrets templates exist in rendered tree.
+for tmpl in \
+    "src/SmokeApp.HttpApi.Host/appsettings.secrets.json.template" \
+    "src/SmokeApp.DbMigrator/appsettings.secrets.json.template" \
+    "src/SmokeApp.HttpApi.Host/appsettings.Development.local.json.template" \
+    "angular/src/environments/environment.local.ts.template"; do
+    if [[ ! -f "${project_root}/${tmpl}" ]]; then
+        # 5d-alt: angular path may not exist if scaffold uses different layout — soft-warn.
+        if [[ "$tmpl" == angular/* && ! -d "${project_root}/angular" ]]; then
+            echo "  (skip: ${tmpl} — no angular/ dir in this scaffold)"
+            continue
+        fi
+        echo "FAIL: secret template missing: ${project_root}/${tmpl}" >&2
+        exit 1
+    fi
+done
+
+# 5e. generate-dev-openiddict-cert.sh executable + runs.
+cert_script="${project_root}/etc/generate-dev-openiddict-cert.sh"
+if [[ ! -x "$cert_script" ]]; then
+    echo "FAIL: $cert_script is not executable" >&2
+    exit 1
+fi
+OPENIDDICT_DEV_CERT_PASS=changeme PROJECT_NAME=SmokeApp \
+    bash "$cert_script" >/dev/null
+if [[ ! -s "${project_root}/src/SmokeApp.HttpApi.Host/openiddict.pfx" ]]; then
+    echo "FAIL: dev cert script ran but openiddict.pfx absent or empty" >&2
+    exit 1
+fi
+# Clean up so the smoke tmpdir trap doesn't carry crypto material around.
+rm -f "${project_root}/src/SmokeApp.HttpApi.Host/openiddict.pfx"
+
 echo "OK: smoke test passed (solution at ${sln}; build log at ${smoke_dir}/build.log)"
