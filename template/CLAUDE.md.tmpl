@@ -1,0 +1,393 @@
+# CLAUDE.md — ${PROJECT_NAME} project guide
+
+Read this at session start when working in the ${PROJECT_NAME} repo. If you ARE running
+an AI-DLC ritual, also read `.ai-dlc/ELABORATION.md`.
+
+## Project at a glance
+
+- **ABP Framework** on **.NET** — backend in `src/`, tests in `test/`.
+{{#if db_ef}}
+- **${DBMS}**; **EF Core**; migrations under `src/${PROJECT_NAME}.EntityFrameworkCore/Migrations/`.
+{{/if}}
+{{#if db_mongodb}}
+- **MongoDB** via `Volo.Abp.MongoDB` — schema-less; no migrations folder. See `src/${PROJECT_NAME}.MongoDB/` for the DbContext and collection registrations.
+{{/if}}
+{{#if ui_angular}}
+- **Angular** + `@abp/ng.*`. SPA at `angular/`. **LeptonX Lite**.
+{{/if}}
+{{#if ui_mvc}}
+- **ASP.NET Core MVC / Razor Pages** UI shipped from `src/${PROJECT_NAME}.Web/`. **LeptonX Lite**.
+{{/if}}
+{{#if ui_blazor}}
+- **Blazor WebAssembly** UI shipped from `src/${PROJECT_NAME}.Blazor/`. **LeptonX Lite**.
+{{/if}}
+{{#if ui_blazor_server}}
+- **Blazor Server** UI shipped from `src/${PROJECT_NAME}.Blazor.Server/`. **LeptonX Lite**.
+{{/if}}
+- **Backend tests:** xUnit + Shouldly + NSubstitute.
+{{#if ui_angular}}
+- **Frontend tests:** Vitest with jsdom.
+{{/if}}
+- Default seeded admin user: `admin` — password comes from `App:AdminPassword` in `appsettings.secrets.json`; never commit the value. The `DbMigrator` fails fast if the key is unset and rejects known-leaked placeholder passwords.
+
+## Required: Use ABP Skills before ABP-specific work
+
+Invoke the relevant `abp-*` Skill BEFORE the corresponding work.
+
+| Work area | Skill |
+|---|---|
+| Application services, DTOs, Mapperly, CRUD | `abp-application-layer` |
+| Angular UI components, guards, proxies, interceptors | `abp-angular` |
+| Domain entities, aggregates, repositories | `abp-ddd` |
+| EF Core repositories, migrations, seeders | `abp-ef-core` |
+| ABP CLI commands (generate-proxy, install-libs, etc.) | `abp-cli` |
+| Permissions, `[Authorize]`, `IsGrantedAsync` | `abp-authorization` |
+| Settings, FeatureChecker, distributed cache, background jobs | `abp-infrastructure` |
+| Anything else ABP, or unsure | `abp-core` |
+
+If a Skill doesn't cover a specific question, fetch version-pinned docs:
+`https://docs.abp.io/en/abp/latest/...`
+
+**ABP standards win over local patterns.** Drift is technical debt — prefer
+the ABP-standard approach for new code and flag legacy patterns in the PR.
+
+## Required: Never hand-edit generated files
+
+Always regenerate via the tool when the source changes. Applies to:
+
+{{#if ui_angular}}
+- `angular/src/app/proxy/**` — regenerate with:
+  ```bash
+  cd angular && abp generate-proxy -t ng -m app -url https://localhost:44326 -o src/app/proxy
+  ```
+{{/if}}
+{{#if ui_mvc}}
+- `wwwroot/libs/` — installed by `abp install-libs`.
+{{/if}}
+{{#if ui_blazor_server}}
+- `wwwroot/libs/` — installed by `abp install-libs`.
+{{/if}}
+{{#if db_ef}}
+- EF Core `Designer.cs` / `*ModelSnapshot.cs` files — managed by `dotnet ef`.
+{{/if}}
+
+If code-review bots flag these files, the only valid fix paths are:
+1. Fix the **source** and regenerate.
+2. If it's a generator quirk with no actionable source change, acknowledge and skip.
+
+## Required: After IdentityUserManager updates, don't trust _userRepository.GetAsync
+
+When you update an `IdentityUser` via `IdentityUserManager` methods (`SetEmailAsync`,
+`SetUserNameAsync`, etc.), a subsequent `_userRepository.GetAsync(userId)` may return
+the EF-tracked entity **without those changes** — the Identity stores write through
+their own path. This bug surfaces in **PostgreSQL but NOT in the SQLite in-memory
+test fixture**, so integration tests pass while production is wrong.
+
+Map from the in-memory variable you just modified, not from a fresh repository read:
+
+```csharp
+var user = await _userManager.GetByIdAsync(profile.UserId);
+CheckIdentityResult(await _userManager.SetEmailAsync(user, input.Email));
+CheckIdentityResult(await _userManager.UpdateAsync(user));
+await uow.CompleteAsync();
+
+// CORRECT: use the in-memory `user` (has the updates)
+var reloaded = await _yourRepo.GetAsync(profile.Id);
+return _mapper.FromEntity(reloaded, user);
+
+// WRONG: returns stale email/username/phone in production
+// var reloadedUser = await _userRepository.GetAsync(reloaded.UserId);
+```
+
+## Required: URL convention for current-user endpoints
+
+User-self-scoped endpoints use `/me` (not `/my`). Place explicit
+**absolute-path** `[Http*]` attributes on the **implementation method**
+(interface attributes are silent decoration — MVC reads from the implementation
+`MethodInfo`). Leading slash is required so the attribute appends to the
+controller prefix rather than replacing it.
+
+```csharp
+[HttpGet("/api/app/account/me")]
+public async Task<AccountDto?> GetMyAsync() { ... }
+
+[HttpPut("/api/app/account/me/profile")]
+public async Task<AccountDto> UpdateMyProfileAsync(...) { ... }
+```
+
+After backend route changes, regenerate the Angular proxy.
+
+## Required: Local dev setup after fresh checkout
+
+```bash
+# 1. Copy secrets templates and fill in REPLACE_ME values.
+cp src/${PROJECT_NAME}.HttpApi.Host/appsettings.secrets.json.template src/${PROJECT_NAME}.HttpApi.Host/appsettings.secrets.json
+cp src/${PROJECT_NAME}.DbMigrator/appsettings.secrets.json.template   src/${PROJECT_NAME}.DbMigrator/appsettings.secrets.json
+# Required keys: ConnectionStrings:Default, App:AdminPassword (both files)
+# Host also needs: AuthServer:CertificatePassPhrase, StringEncryption:DefaultPassPhrase
+```
+
+{{#if ui_mvc}}
+```bash
+# 2. Install ABP client libs.
+abp install-libs
+```
+{{/if}}
+{{#if ui_blazor_server}}
+```bash
+# 2. Install ABP client libs.
+abp install-libs
+```
+{{/if}}
+{{#if ui_angular}}
+```bash
+# 2. Install ABP client libs (angular client assets).
+abp install-libs
+
+# 3. Install Angular dependencies.
+yarn --cwd angular install
+```
+{{/if}}
+
+```bash
+# Apply migrations + seed.
+dotnet run --project src/${PROJECT_NAME}.DbMigrator
+```
+
+**`Microsoft.EntityFrameworkCore.InMemory` in `${PROJECT_NAME}.HttpApi.Host.csproj`
+is a version pin, not unused.** Removing it causes a `MissingMethodException`
+on startup from the HealthChecks UI initializer.
+
+## Recommended: Run the full stack via Docker Compose (for cross-service verification)
+
+For "verify the prod-shaped stack works on my laptop" use:
+
+```bash
+# .env ships a dev-safe OPENIDDICT_DEV_CERT_PASS default — no edit needed.
+docker compose --profile full up -d --wait --build
+# Visit https://localhost/  (use `curl -k`; Caddy uses an internal CA in dev)
+```
+
+This is NOT a replacement for the inner loop (`dotnet run` + `yarn start`).
+Use compose when you need to validate cross-service behavior, the
+secrets-mounting pattern, or the Caddy edge routing. See the compose files
+in the repo root for the full operator guide.
+
+## Optional: per-developer local config overrides (network-reachable dev)
+
+`appsettings.Development.json`{{#if ui_angular}} and `angular/src/environments/environment.ts`{{/if}}
+ship `localhost`-only URLs by default. When running from a remote dev
+box / LXC / container where the host{{#if ui_angular}} and SPA{{/if}} must be reachable from
+another machine (different IP / hostname), use the **gitignored**
+override files that mirror the committed templates:
+
+```bash
+# Host side: ASP.NET config override (CORS, RedirectAllowedUrls, AuthServer:Authority, App:SelfUrl, App:AngularUrl)
+cp src/${PROJECT_NAME}.HttpApi.Host/appsettings.Development.local.json.template \
+   src/${PROJECT_NAME}.HttpApi.Host/appsettings.Development.local.json
+# edit REPLACE_ME_HOST → your dev box's IP or hostname
+```
+
+{{#if ui_angular}}
+```bash
+# Angular side: SPA-bundle environment override (apis.default.url, oAuthConfig.issuer, baseUrl, redirectUri)
+cp angular/src/environments/environment.local.ts.template \
+   angular/src/environments/environment.local.ts
+# edit REPLACE_ME_HOST → same value as above
+```
+{{/if}}
+
+Then:
+
+```bash
+# Run host (default URL is launchSettings — override here to bind 0.0.0.0)
+dotnet run --project src/${PROJECT_NAME}.HttpApi.Host --urls "https://0.0.0.0:44326"
+```
+
+{{#if ui_angular}}
+```bash
+# Run Angular with the local override + bind 0.0.0.0
+yarn --cwd angular start:local
+```
+
+`yarn start:local` is a wired script that calls `ng serve --configuration
+local --host 0.0.0.0`. The `local` Angular configuration is defined in
+`angular.json` and swaps `environment.ts` → `environment.local.ts` via
+`fileReplacements`.
+{{/if}}
+
+After changing the override URLs, re-run the DbMigrator so the
+OpenIDDict seeded client picks up the new `RedirectAllowedUrls` (the
+client's per-row allow-list is stored in the database; ABP refreshes
+it on each migrator run from `App:RedirectAllowedUrls`):
+
+```bash
+dotnet run --project src/${PROJECT_NAME}.DbMigrator
+```
+
+**NEVER put secrets in these `*.local.*` files.** Secrets still live
+in `appsettings.secrets.json`, loaded by `.AddAppSettingsSecretsJson()`.
+The `.local` files are for non-secret URL / IP overrides only.
+
+## Required: PR auto-close keyword — repeat per issue, no comma chains
+
+`Closes #9, #10, #11` auto-closes ONLY `#9`. Repeat the keyword for each issue:
+
+```
+Closes #22, closes #23, closes #24
+```
+
+or one per line. Verify with `gh pr view <num> --json closingIssuesReferences`
+immediately after creation.
+
+## Quality gates
+
+```bash
+dotnet build ${PROJECT_NAME}.slnx
+dotnet test ${PROJECT_NAME}.slnx
+```
+
+{{#if ui_angular}}
+```bash
+yarn --cwd angular lint
+yarn --cwd angular test --watch=false
+yarn --cwd angular build
+```
+{{/if}}
+
+For UI changes, also smoke-test in a browser. Use Chrome DevTools MCP if available.
+
+## Dependabot policy
+
+`.github/workflows/dependabot-auto-merge.yml` auto-merges Dependabot PRs
+**after `CICD` succeeds** when ALL of these are true:
+
+- The PR title is parseable as `from X.Y.Z to A.B.C` (single-dep PR; grouped
+  PRs are skipped because they lack version info in the title)
+- `update-type` is `semver-patch` or `semver-minor` (no major-version bumps)
+- `package-ecosystem` is NOT `github-actions` (those carry implicit-API risk
+  and stay manual)
+- The PR has no `do-not-merge` label
+
+Everything else stays open for human review:
+
+- Major version bumps (any ecosystem)
+- All github-actions bumps (`docker/*`, `dorny/*`, `actions/*`)
+- Grouped Dependabot PRs (title pattern `bump the <name> group`)
+- PRs with unparseable titles (defensive fallback if Dependabot's title
+  format ever drifts)
+
+**Known limitation — `maintainer-changes` is not enforced.** Dependabot can
+flag PRs where the upstream maintainer changed via the `maintainer-changes`
+metadata, but that signal is only available through `dependabot/fetch-metadata`,
+which does not work in `workflow_run` event contexts. This workflow relies on
+title/branch parsing only, so it cannot gate on `maintainer-changes`. The
+github-actions exclusion + major-bump skip cover the highest-risk cases; the
+`do-not-merge` label remains the per-PR operator override for everything else.
+
+**Per-PR override** — add the `do-not-merge` label to block auto-merge on a
+specific PR (e.g., when you want to test the update locally first).
+
+**Disable globally** — rename
+`.github/workflows/dependabot-auto-merge.yml` →
+`.github/workflows/dependabot-auto-merge.yml.disabled` and push. GitHub
+ignores files that don't end in `.yml`/`.yaml`, so auto-merge halts
+immediately. To re-enable, rename back.
+
+**Backlog clear** — to apply auto-merge to PRs created before the workflow
+existed, trigger manually:
+
+```bash
+gh workflow run dependabot-auto-merge.yml -f pr_number=<NNN>
+```
+
+**Required repo + org settings** (operator action, one-time):
+
+- Settings → Actions → General → "Workflow permissions" → "Allow GitHub
+  Actions to create and approve pull requests" — **ON** (required at BOTH
+  the org level and the repo level — the org setting overrides repo).
+  Without this, `gh pr review --approve` returns HTTP 422 and the merge
+  step fails. Verify via:
+  `gh api repos/<owner>/<repo>/actions/permissions/workflow` →
+  `can_approve_pull_request_reviews: true`.
+
+**Optional repo settings:**
+
+- Settings → General → "Automatically delete head branches" — left OFF in
+  this repo. The workflow already passes `--delete-branch` to `gh pr
+  merge`, so Dependabot branches clean themselves up regardless of this
+  setting. Flipping it would also affect manual merges (broader scope than
+  the auto-merge workflow needs).
+
+## Conventions
+
+- **Backend code style:** mandatory braces on all control-flow statements (ReSharper-enforced). Root namespace `${PROJECT_NAME}` everywhere. All custom tables use prefix `${PROJECT_NAME}Consts.DbTablePrefix = "App"`, schema `null`.
+- **Inherit `${PROJECT_NAME}AppService`** for application services (sets `LocalizationResource = typeof(${PROJECT_NAME}Resource)`).
+- **Inherit `FullAuditedAggregateRoot<Guid>`** for new aggregate roots — gives soft-delete, audit columns, and concurrency stamp for free.
+{{#if ui_angular}}
+- **Angular components are standalone** with `inject()` DI (see your repo's first standalone component for the canonical pattern). Selectors kebab-case with `app` prefix.
+- **Prettier 100-col single-quote**, enforced by lint.
+{{/if}}
+- **Localization JSON** under `src/${PROJECT_NAME}.Domain.Shared/Localization/${PROJECT_NAME}/` — keep your `${DEFAULT_CULTURE}.json` (default) and any other culture files in sync. Cross-resource ABP keys use `'AbpUi::Delete'` (resource::key), NOT `'::AbpUi:Delete'`.
+- **CSP defaults to Report-Only.** `App:Csp:Mode` defaults to `report-only` in `appsettings.json`. Operators ramp to enforcement after a 7-14 day soak by setting `App:Csp:Mode=enforce` (and optionally `App:Csp:ReportUri` to receive violation reports). The CSP middleware is at `src/${PROJECT_NAME}.HttpApi.Host/Middleware/ContentSecurityPolicyMiddleware.cs`.{{#if ui_angular}} The SPA-edge headers (CSP + HSTS + X-Frame-Options + X-Content-Type-Options + Referrer-Policy) live in `angular/nginx.conf`.{{/if}} HSTS on the host starts at 30 days (no `includeSubDomains`, no `preload`) — bump to 1 year after soak; never enable preload without explicit operator sign-off (it is irrevocable in practice).
+- **OTel custom Meter naming.** Every custom `System.Diagnostics.Metrics.Meter` instantiated in code uses the prefix `${PROJECT_NAME}.<Feature>` (PascalCase, dot-prefixed) — e.g., `new Meter("${PROJECT_NAME}.<Feature>")`. Instrument names use snake_case + unit suffix (e.g., `<feature>_<event>_total`, `<feature>_<event>_duration_ms`). The OTel Prometheus exporter auto-translates the meter dot-prefix to underscore: scrape view is `${PROJECT_NAME_LOWER}_<feature>_<event>_total{...}`. NEVER carry PII (filenames, user ids) in metric tags — only finite-cardinality dimensions like `reason`.
+
+## Where things live (project-specific)
+
+> Add your project-specific reference points here as your codebase
+> grows. For each load-bearing pattern in your codebase (canonical
+> example, single-source-of-truth constants file, single-point-of-
+> change for cross-cutting concerns), add a bullet here so other
+> contributors can find them. See LinkHub's CLAUDE.md for the shape:
+> https://github.com/codarteinc/linkhub/blob/main/CLAUDE.md (the
+> "Where things live" and "Runtime artifacts" sections are good
+> templates).
+
+## Runtime artifacts (project-specific)
+
+> Add operator-facing runtime artifact pointers here as your project
+> grows: log file paths, monitoring dashboards, error-tracking
+> projects, etc. See LinkHub's CLAUDE.md "Runtime artifacts" section
+> for the shape.
+
+## Operational endpoints
+
+Operational HTTP surface for k8s probes, Prometheus scrapes, and OTLP trace export.
+
+- `/health-live` — process liveness probe. Anonymous, no DB, status 200
+  if Kestrel can route a request. K8s liveness probe target. Body is
+  empty by design (no fingerprint).
+- `/health-ready` — readiness probe with database connectivity check.
+  Auth-gated by the `HealthChecksPolicy` (requires `admin` OR
+  `health-monitor` role). K8s readiness probe target — operator
+  configures the probe with a service-account token tied to the
+  `health-monitor` role (seeded by
+  `${PROJECT_NAME}HealthMonitorRoleSeedContributor`; binding to specific
+  service accounts is an operator concern). Body is plain text:
+  `healthy` (200) or `unhealthy` (503). The wrapped exception, if any,
+  is logged to `Logs/log-{date}.txt` — never the response body.
+- `/metrics` — Prometheus scrape endpoint emitting AspNetCore
+  instrumentation metrics + every `${PROJECT_NAME}.*` custom meter (see
+  `OTel custom Meter naming` under Conventions). Same auth as
+  `/health-ready` by default. Operators with network-level controls
+  (k8s NetworkPolicy, IP allowlist at the LB) can override via
+  `App:Metrics:Auth=false`.
+- **Removed:** `/health-status`, `/health-ui`, `/health-api`,
+  `/health` (return 404). These were anonymous-readable in the
+  default ABP shape and leaked DB connectivity + framework fingerprint
+  (`HealthChecks.UI`). Migrate any external scrape configured against
+  the old paths to `/health-ready` with a service-account token.
+
+OTLP traces export to `$OTEL_EXPORTER_OTLP_ENDPOINT` when the env var
+is set; no-op when unset (no app config change needed). Optional
+companions: `OTEL_SERVICE_NAME` (defaults to `${PROJECT_NAME_LOWER}-api`),
+`OTEL_RESOURCE_ATTRIBUTES` (e.g.,
+`deployment.environment=staging,service.namespace=${PROJECT_NAME_LOWER}`).
+
+## Useful references
+
+- ABP docs: https://docs.abp.io/en/abp/latest/
+{{#if ui_angular}}
+- ABP Angular module reference: https://docs.abp.io/en/abp/latest/UI/Angular/
+{{/if}}
+- `docker-compose.yml` (repo root) — long-form Docker / Compose / GHCR / deploy guide
