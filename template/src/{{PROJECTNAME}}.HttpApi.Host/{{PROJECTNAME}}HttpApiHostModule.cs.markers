@@ -15,4 +15,11 @@ BLOCK otel
 BLOCK health-endpoints
 BLOCK csp-middleware
 BLOCK hsts
+
+# Inside PreConfigureServices(...) — the OpenIddict prod/dev cert switch
+# must wire up BEFORE the ABP modules' OnApplicationInitialization runs
+# so the OpenIddict server picks up the operator-supplied cert in
+# non-Development environments. Unit-05 ownership; see overlay-blocks/
+# unit-05/module-openiddict-cert.cs for the body.
+ANCHOR ^[[:space:]]*public override void PreConfigureServices\(.*\)[[:space:]]*$
 BLOCK openiddict-cert

@@ -1,0 +1,45 @@
+// Per-developer local override for the Angular dev server. NOT committed.
+//
+// Copy this file to `environment.local.ts` (sibling) and edit the
+// constants below so the SPA + OAuth client talk to whatever host /
+// IP your dev environment runs on. Then start with:
+//
+//   yarn start:local
+//
+// `yarn start` (no suffix) still uses the committed `environment.ts`
+// with `localhost`, so it Just Works on a single-machine setup.
+//
+// Mirrors the host-side `appsettings.Development.local.json` —
+// keep the URLs aligned across both files so OAuth + CORS line up.
+
+import { Environment } from '@abp/ng.core';
+
+const baseUrl = 'http://REPLACE_ME_HOST:4200';
+
+const oAuthConfig = {
+  issuer: 'https://REPLACE_ME_HOST:44326/',
+  redirectUri: baseUrl,
+  clientId: '${PROJECT_NAME}_App',
+  responseType: 'code',
+  scope: 'offline_access ${PROJECT_NAME}',
+  requireHttps: true,
+};
+
+export const environment: Environment = {
+  production: false,
+  application: {
+    baseUrl,
+    name: '${PROJECT_NAME}',
+  },
+  oAuthConfig,
+  apis: {
+    default: {
+      url: 'https://REPLACE_ME_HOST:44326',
+      rootNamespace: '${PROJECT_NAME}',
+    },
+    AbpAccountPublic: {
+      url: oAuthConfig.issuer,
+      rootNamespace: 'AbpAccountPublic',
+    },
+  },
+};

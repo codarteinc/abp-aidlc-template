@@ -1,0 +1,13 @@
+{
+  "_comment": "Per-developer local override for the API host. NOT committed. Copy to `appsettings.Development.local.json` (sibling) and edit. Loaded AFTER appsettings.Development.json so these keys WIN. Mirrors the Angular-side environment.local.ts — keep URLs aligned so OAuth + CORS line up. NEVER put secrets here; secrets live in appsettings.secrets.json.",
+
+  "App": {
+    "SelfUrl": "https://REPLACE_ME_HOST:44326",
+    "AngularUrl": "http://REPLACE_ME_HOST:4200",
+    "CorsOrigins": "http://REPLACE_ME_HOST:4200,http://localhost:4200",
+    "RedirectAllowedUrls": "http://REPLACE_ME_HOST:4200,http://localhost:4200"
+  },
+  "AuthServer": {
+    "Authority": "https://REPLACE_ME_HOST:44326"
+  }
+}
