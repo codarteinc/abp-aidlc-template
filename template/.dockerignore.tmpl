@@ -1,0 +1,67 @@
+# ${PROJECT_NAME} root-level .dockerignore
+#
+# Inclusive-exclusion pattern: exclude everything by default, then
+# re-include only what the .NET build stages need, then re-exclude
+# build artifacts / secrets / local-only files even if they appear
+# inside re-included trees.
+#
+# Verify post-edit:
+#   tar c --exclude-from=.dockerignore . | wc -c   # must be reasonably small
+
+# 1. Exclude everything by default
+**
+
+# 2. Re-include the .NET solution + source.
+#
+# `test/` is intentionally NOT re-included: the .NET Dockerfiles use
+# project-scoped restore so the build context does not need test projects.
+!${PROJECT_NAME}.slnx
+!common.props
+!global.json
+!NuGet.Config
+!src/
+
+# 3. Re-include this .dockerignore so future stages can reference it
+!.dockerignore
+
+# 4. Always exclude these even when re-included above
+**/bin/
+**/obj/
+**/Logs/
+**/.vs/
+**/.idea/
+**/node_modules/
+**/dist/
+**/*.user
+
+# 5. Secrets and per-developer local overrides
+**/appsettings.secrets.json
+**/appsettings.*.local.json
+**/openiddict.pfx
+**/*.pfx
+**/*.key
+**/.env
+**/.env.*
+
+# 6. Repo-management surface
+.git/
+.github/
+.gitignore
+.gitattributes
+.editorconfig
+.ai-dlc/
+docs/
+{{#if UI_ANGULAR}}
+angular/
+{{/if}}
+etc/
+README.md
+*.md
+
+# 7. CI / tooling that doesn't affect dotnet restore/publish.
+.devcontainer/
+.vscode/
+.husky/
+docker-compose*.yml
+Dockerfile
+Dockerfile.*

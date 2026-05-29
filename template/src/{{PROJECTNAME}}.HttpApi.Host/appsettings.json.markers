@@ -1,0 +1,9 @@
+# Marker directives for appsettings.json.
+#
+# JSON files cannot host comments, so this unit emits sentinel-key
+# pairs `"//scaffold-block-X-start": ""` immediately after the top-level
+# opening brace. ASP.NET Core's IConfiguration loader tolerates unknown
+# keys.
+ANCHOR ^\{$
+BLOCK serilog-config
+BLOCK csp-defaults

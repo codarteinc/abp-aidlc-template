@@ -117,10 +117,16 @@ _marker_close_pattern() {
 # If no brace-only line is encountered before EOF, falls back to the
 # anchor-line insertion behaviour (used for JSON top-level "{" anchors).
 _insert_empty_marker_pair() {
-    local file="$1" anchor="$2" name="$3" style="$4"
+    local file="$1" anchor="$2" name="$3" style="$4" strategy="${5:-}"
     local after_brace=1
     case "$style" in
         json) after_brace=0 ;;
+    esac
+    # Caller override (set by merge_markers_into_existing per
+    # ANCHOR / ANCHOR_INLINE directive).
+    case "$strategy" in
+        inline)      after_brace=0 ;;
+        after_brace) after_brace=1 ;;
     esac
     local open close
     open=$(_marker_open_pattern "$style" "$name") || return 1
@@ -279,6 +285,17 @@ scaffold_assert_block_present() {
 # first line matching its preceding ANCHOR regex. If the marker pair is
 # already present anywhere in the file, the BLOCK is silently skipped
 # (idempotent).
+#
+# DSL directives:
+#   ANCHOR <regex>        — marker pair lands after the Allman `{` that
+#                           immediately follows the anchor line (the
+#                           default for csharp/msbuild styles). Use for
+#                           method-signature anchors.
+#   ANCHOR_INLINE <regex> — marker pair lands immediately after the
+#                           anchor line itself. Use when anchoring on a
+#                           statement inside an existing method body.
+#   BLOCK <name>          — emit an empty marker pair for the named
+#                           block, using the current anchor + strategy.
 merge_markers_into_existing() {
     local existing="$1" markers="$2"
     if [[ ! -f "$existing" ]]; then
@@ -295,6 +312,11 @@ merge_markers_into_existing() {
     style=$(_marker_style_for "$existing") || return 1
 
     local current_anchor=""
+    local current_strategy="after_brace"   # default for csharp/msbuild
+    # JSON style always uses inline (sentinel keys go right under "{").
+    if [[ "$style" == "json" ]]; then
+        current_strategy="inline"
+    fi
     local line directive rest block_name
     while IFS= read -r line || [[ -n "$line" ]]; do
         # Skip blanks + comments.
@@ -308,7 +330,20 @@ merge_markers_into_existing() {
         case "$directive" in
             ANCHOR)
                 current_anchor="$rest"
-                # Verify anchor matches at least once in the existing file.
+                if [[ "$style" == "json" ]]; then
+                    current_strategy="inline"
+                else
+                    current_strategy="after_brace"
+                fi
+                if ! grep -qE -- "$current_anchor" "$existing"; then
+                    log_fail "merge_markers_into_existing: anchor not found in $existing: $current_anchor" \
+                        "merge_markers_into_existing"
+                    return 1
+                fi
+                ;;
+            ANCHOR_INLINE)
+                current_anchor="$rest"
+                current_strategy="inline"
                 if ! grep -qE -- "$current_anchor" "$existing"; then
                     log_fail "merge_markers_into_existing: anchor not found in $existing: $current_anchor" \
                         "merge_markers_into_existing"
@@ -327,7 +362,7 @@ merge_markers_into_existing() {
                     return 1
                 fi
                 _insert_empty_marker_pair "$existing" "$current_anchor" \
-                    "$block_name" "$style" || return 1
+                    "$block_name" "$style" "$current_strategy" || return 1
                 ;;
             *)
                 log_fail "merge_markers_into_existing: unrecognized directive: $line" \

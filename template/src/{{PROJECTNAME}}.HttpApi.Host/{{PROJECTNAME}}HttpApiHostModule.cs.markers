@@ -1,0 +1,18 @@
+# Marker directives for the host AbpModule subclass.
+# Format: see lib/dotnet-overlay.sh `merge_markers_into_existing` §4.3.
+#
+# Anchors target the ABP-CLI-default method signatures; markers are
+# inserted INSIDE the method body (after the Allman `{` line) via the
+# after-brace strategy in _insert_empty_marker_pair.
+
+# Inside ConfigureServices(...) — JSON loader hookup (secrets file).
+ANCHOR ^[[:space:]]*public override void ConfigureServices\(.*\)[[:space:]]*$
+BLOCK secrets-json-loader
+
+# Inside OnApplicationInitialization(...) — middleware wire-up.
+ANCHOR ^[[:space:]]*public override void OnApplicationInitialization\(.*\)[[:space:]]*$
+BLOCK otel
+BLOCK health-endpoints
+BLOCK csp-middleware
+BLOCK hsts
+BLOCK openiddict-cert

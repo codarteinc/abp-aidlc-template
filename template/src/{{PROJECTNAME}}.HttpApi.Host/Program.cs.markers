@@ -1,0 +1,16 @@
+# Marker directives for Program.cs.
+#
+# Top-of-Main: serilog bootstrap goes BEFORE WebApplication.CreateBuilder.
+# ANCHOR (after-brace) targets the Main signature; marker lands inside
+# the method body after the Allman `{`, ahead of any vanilla CreateBuilder
+# wiring.
+ANCHOR ^[[:space:]]*public[[:space:]]+(static[[:space:]]+)?(async[[:space:]]+)?(Task<int>|int|Task)[[:space:]]+Main\(string\[\][[:space:]]+args\)[[:space:]]*$
+BLOCK serilog-bootstrap
+
+# After var builder = WebApplication.CreateBuilder(args); — use INLINE
+# anchor because we want the marker pair RIGHT AFTER this body statement,
+# not after some downstream brace.
+ANCHOR_INLINE ^[[:space:]]*var[[:space:]]+builder[[:space:]]*=[[:space:]]*WebApplication\.CreateBuilder\(args\)
+BLOCK fwd-headers
+BLOCK cookie-antiforgery-cors
+BLOCK production-fail-fast

@@ -469,17 +469,108 @@ phase_apply_overlays() {
         log_warn "template/ dir missing — skipping overlays"
         return 0
     fi
-    # Iterate every file under template/ (placeholder loop — units 03-10
-    # drop real overlay files here and this iterator handles them
-    # unchanged). NOTE: we don't actually copy + substitute in unit-01
-    # because the target tree from `abp new` doesn't exist yet; we
-    # only enumerate so operators see what would happen.
-    local count=0
-    while IFS= read -r -d '' f; do
-        count=$((count + 1))
-        log_info "overlay candidate: ${f#"$TEMPLATE_DIR"/}"
-    done < <(find "$TEMPLATE_DIR" -type f ! -name '.keep' -print0)
-    log_info "overlay files discovered: $count"
+
+    # Lazy-source the .NET overlay helpers. Unit-01 tests that only
+    # exercise dry-run-abp-new don't need to pay the cost of sourcing.
+    # shellcheck source=lib/dotnet-overlay.sh
+    source "${LIB_DIR}/dotnet-overlay.sh"
+
+    # Dry-run mode: no real target tree exists (or it's an ephemeral
+    # tmpdir created by phase_create_target_dir). Enumerate what would
+    # be written and stop — matches the unit-01 contract that --dry-run
+    # is a no-op operationally.
+    #
+    # Also short-circuit on --dry-run-abp-new (the bats test-only flag):
+    # in that mode phase_abp_new returned WITHOUT actually scaffolding a
+    # tree, so the .markers files have no sibling files to merge into.
+    if (( DRY_RUN == 1 )) || (( DRY_RUN_ABP_NEW == 1 )); then
+        local count=0
+        while IFS= read -r -d '' f; do
+            count=$((count + 1))
+            log_info "[overlay-dotnet] dry-run candidate: ${f#"$TEMPLATE_DIR"/}"
+        done < <(find "$TEMPLATE_DIR" -type f ! -name '.keep' -print0)
+        log_info "[overlay-dotnet] overlay files discovered: $count"
+        return 0
+    fi
+
+    local target_real
+    target_real="$(realpath "$TARGET_DIR")"
+
+    # 1. Copy every file under template/ to the target. For each file:
+    #    a. Strip template/ prefix.
+    #    b. Substitute {{PROJECTNAME}} -> $PROJECT_NAME in every segment.
+    #    c. mkdir -p the destination parent.
+    #    d. cp -p the file (preserves mode/mtime; binary-safe — text
+    #       substitution skips binaries via the file --mime sniff).
+    #    e. Log the destination so operators see what was touched.
+    local src dst rendered_rel rel
+    local -a applied_files=()
+    while IFS= read -r -d '' src; do
+        rel="${src#"$TEMPLATE_DIR"/}"
+        [[ "$rel" == ".keep" ]] && continue
+        rendered_rel="${rel//\{\{PROJECTNAME\}\}/${PROJECT_NAME}}"
+        dst="${target_real}/${rendered_rel}"
+        mkdir -p "$(dirname "$dst")"
+        cp -p "$src" "$dst"
+        applied_files+=("$dst")
+        log_info "[overlay-dotnet] writing ${rendered_rel}"
+    done < <(find "$TEMPLATE_DIR" -type f -print0)
+
+    # 2. Substitute content. Per-suffix dispatch:
+    #    - *.markers -> deferred to step 3.
+    #    - *.tmpl    -> substitute_tmpl (drops .tmpl on success).
+    #    - else      -> substitute_file (no-op on binaries).
+    local f
+    for f in "${applied_files[@]}"; do
+        case "$f" in
+            *.markers) continue ;;
+            *.tmpl)    substitute_tmpl "$f" || return 1 ;;
+            *)         substitute_file "$f" || return 1 ;;
+        esac
+    done
+
+    # 3. Marker-file merge: for each *.markers file under target_real,
+    #    locate its sibling file (sans .markers) and inject the empty
+    #    ScaffoldBlock pairs at the documented anchors. Then delete
+    #    the .markers file (it has served its purpose).
+    local markers existing
+    while IFS= read -r -d '' markers; do
+        existing="${markers%.markers}"
+        if [[ ! -f "$existing" ]]; then
+            log_fail "[overlay-dotnet] marker target missing: $existing" \
+                "merge_markers_into_existing"
+            return 1
+        fi
+        merge_markers_into_existing "$existing" "$markers" || return 1
+        rm -f "$markers"
+        log_info "[overlay-dotnet] merged ScaffoldBlock markers into ${existing#"$target_real"/}"
+    done < <(find "$target_real" -type f -name '*.markers' -print0)
+
+    # 4. RootNamespace injection on every csproj under src/ + test/.
+    #    Idempotent — running on a csproj that already carries the
+    #    correct value is a no-op (and on one missing it inserts).
+    local csproj
+    while IFS= read -r -d '' csproj; do
+        dotnet_overlay_set_root_namespace "$csproj" "${PROJECT_NAME}" || return 1
+        log_info "[overlay-dotnet] RootNamespace -> ${csproj#"$target_real"/}"
+    done < <(find "${target_real}/src" "${target_real}/test" -type f -name '*.csproj' -print0 2>/dev/null)
+
+    # 5. Mapperly swap on the Application csproj + DependsOn on the
+    #    application module. Both idempotent — unit-11's order-
+    #    independence smoke test depends on re-runs being byte-identical.
+    local app_csproj="${target_real}/src/${PROJECT_NAME}.Application/${PROJECT_NAME}.Application.csproj"
+    local app_module="${target_real}/src/${PROJECT_NAME}.Application/${PROJECT_NAME}ApplicationModule.cs"
+    if [[ -f "$app_csproj" ]]; then
+        dotnet_overlay_swap_automapper_for_mapperly "$app_csproj" || return 1
+        log_info "[overlay-dotnet] AutoMapper -> Mapperly on ${app_csproj#"$target_real"/}"
+    fi
+    if [[ -f "$app_module" ]]; then
+        dotnet_overlay_add_dependson_attribute "$app_module" \
+            "AbpMapperlyModule" "using Volo.Abp.Mapperly;" || return 1
+        log_info "[overlay-dotnet] DependsOn(AbpMapperlyModule) -> ${app_module#"$target_real"/}"
+    fi
+
+    log_ok "overlay-dotnet applied"
 }
 
 phase_run_post_init_commands() {
