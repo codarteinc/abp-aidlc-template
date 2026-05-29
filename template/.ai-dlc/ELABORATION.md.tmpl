@@ -1,0 +1,48 @@
+# Elaboration Guidance — ${PROJECT_NAME}
+
+This file is read by `/ai-dlc:elaborate` and supplements the skill's
+default behavior with project-specific rules. Adhere to it on every
+elaboration — both end-to-end and manual.
+
+For an **AI-DLC worktree** (`git worktree add` doesn't copy gitignored
+files):
+```bash
+WORKTREE=.ai-dlc/worktrees/<intent-slug>
+cp src/${PROJECT_NAME}.HttpApi.Host/appsettings.secrets.json "$WORKTREE/src/${PROJECT_NAME}.HttpApi.Host/appsettings.secrets.json"
+cp src/${PROJECT_NAME}.DbMigrator/appsettings.secrets.json   "$WORKTREE/src/${PROJECT_NAME}.DbMigrator/appsettings.secrets.json"
+cp .claude/settings.local.json "$WORKTREE/.claude/settings.local.json" 2>/dev/null || true
+cd "$WORKTREE" && abp install-libs{{#if ui_angular}} && yarn --cwd angular install{{/if}}
+```
+
+## Required: Sync tickets to GitHub Issues
+
+`.ai-dlc/settings.yml` declares `providers.ticketing: github-issues`.
+Phases 6.5 + 6.75 (Ticket Sync) of `/ai-dlc:elaborate` are
+**mandatory**, not optional, before the intent branch is pushed to
+origin.
+
+If running `/ai-dlc:elaborate` end-to-end, the skill handles this.
+If doing a manual elaboration (writing intent.md + units directly
+without running the full skill), still create the issues — either
+invoke the elaborate-ticket-sync subskill, or use `gh` CLI:
+
+- One epic issue titled `[AI-DLC Epic] {Intent Title}` labeled
+  `ai-dlc`.
+- One child issue per unit titled `[unit-NN] {description}` labeled
+  `ai-dlc`, cross-linking to the epic in the body.
+- Update `intent.md` frontmatter `epic: "${GITHUB_OWNER}/${PROJECT_NAME_LOWER}#N"`.
+- Update each `unit-NN-*.md` frontmatter `ticket: "${GITHUB_OWNER}/${PROJECT_NAME_LOWER}#N"`.
+
+If your team doesn't use GitHub Issues for ticketing, set
+`providers.ticketing.type: none` in `.ai-dlc/settings.yml` and skip
+this section.
+
+## Reference
+
+- `.ai-dlc/knowledge/` — synthesized project knowledge
+  (architecture, conventions, design, domain, product). The first
+  deep run of `/ai-dlc:elaborate` populates this directory; you can
+  also seed it manually. Read it before elaboration.
+- Project memory at `~/.claude/projects/.../memory/` — process
+  rules and gotchas captured from prior intents.
+- Official ABP docs: https://docs.abp.io
