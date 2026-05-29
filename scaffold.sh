@@ -47,22 +47,29 @@ CURRENT_PHASE=""
 CONFIG_PATH=""
 TARGET_DIR=""
 DRY_RUN=0
+DRY_RUN_ABP_NEW=0
+# ABP_VERSION may be set by --abp-version flag, by env, or autodetected
+# inside phase_abp_new. Initialize from env so an operator export wins
+# over autodetect but loses to an explicit --abp-version flag.
+ABP_VERSION="${ABP_VERSION:-}"
 
 print_help() {
     cat <<EOF
 scaffold.sh — one-command ABP scaffold with LinkHub-grade infra/CI/devops baked in.
 
 USAGE:
-  scaffold.sh [--config <path>] [--target <dir>] [--dry-run]
+  scaffold.sh [--config <path>] [--target <dir>] [--dry-run] [--abp-version <X.Y.Z>]
   scaffold.sh --help
 
 FLAGS:
-  --config <path>   Path to a scaffold config YAML (skips interactive prompts).
-  --target <dir>    Target directory for the scaffolded project.
-                    Defaults to ./<project_name_lower> once config is loaded.
-  --dry-run         Run every phase as a no-op and exit 0. Useful for smoke
-                    tests of the orchestration pipeline.
-  --help, -h        Show this banner.
+  --config <path>       Path to a scaffold config YAML (skips interactive prompts).
+  --target <dir>        Target directory for the scaffolded project.
+                        Defaults to ./<project_name_lower> once config is loaded.
+  --dry-run             Run every phase as a no-op and exit 0. Useful for smoke
+                        tests of the orchestration pipeline.
+  --abp-version <X.Y.Z> Pin the ABP framework version passed to 'abp new'.
+                        Defaults to the locally-installed CLI's reported version.
+  --help, -h            Show this banner.
 
 CONFIG FLAGS (enumerated from scaffold-config-schema.yml):
 EOF
@@ -92,6 +99,19 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             DRY_RUN=1
+            shift
+            ;;
+        --abp-version)
+            ABP_VERSION="${2:-}"
+            export ABP_VERSION
+            shift 2
+            ;;
+        --dry-run-abp-new)
+            # Test-only short-circuit for bats. Intentionally undocumented
+            # in --help so operators never see it. Causes phase_abp_new to
+            # print the assembled flag array and return 0 without invoking
+            # the real `abp new` binary.
+            DRY_RUN_ABP_NEW=1
             shift
             ;;
         --help|-h)
@@ -165,6 +185,23 @@ _export_config_env() {
     [[ "$TIERED" == "true" ]] && IF_TIERED=1
     export IF_UI_ANGULAR IF_UI_MVC IF_UI_BLAZOR IF_UI_BLAZOR_SERVER IF_UI_NONE
     export IF_DB_EF IF_DB_MONGODB IF_MULTI_TENANCY IF_TIERED
+
+    # unit-02 ABP_* aliases — stable namespaced contract for the abp_new
+    # wrapper and downstream overlays. Keep in lock-step with the unit-01
+    # bareword exports above. ABP_VERSION is NOT set here; phase_abp_new
+    # resolves it from the --abp-version flag / env / `abp --version`.
+    ABP_TEMPLATE=$(yq '.abp.template // "app"' "$cfg")
+    ABP_UI="$UI"
+    ABP_DB_PROVIDER="$DB_PROVIDER"
+    ABP_DBMS="$DBMS"
+    ABP_MULTI_TENANCY="$MULTI_TENANCY"
+    ABP_TIERED="$TIERED"
+    ABP_DEFAULT_CULTURE="$DEFAULT_CULTURE"
+    ABP_THEME="${ABP_THEME:-leptonx-lite}"
+    # yq emits a YAML array; flatten to CSV (empty string when []).
+    ABP_OPTIONAL_MODULES=$(yq -r '.abp.optional_modules // [] | join(",")' "$cfg")
+    export ABP_TEMPLATE ABP_UI ABP_DB_PROVIDER ABP_DBMS ABP_MULTI_TENANCY
+    export ABP_TIERED ABP_DEFAULT_CULTURE ABP_THEME ABP_OPTIONAL_MODULES
 }
 
 # --- phases ---------------------------------------------------------------
@@ -252,13 +289,19 @@ phase_validate_config() {
 }
 
 phase_recommend() {
-    _phase_start "phase_recommend (stub — unit-02)"
-    log_info "recommendation engine populates here in unit-02"
+    _phase_start "phase_recommend"
+    # The recommendation engine lives in the /scaffold-app Claude skill,
+    # not in scaffold.sh. Standalone runs (config-file mode) already
+    # know what they want — this phase is intentionally a no-op here.
+    log_info "standalone mode — recommendation engine skipped (config supplied)"
 }
 
 phase_confirm() {
-    _phase_start "phase_confirm (stub — unit-02)"
-    log_info "operator confirmation prompt populates here in unit-02"
+    _phase_start "phase_confirm"
+    # Interactive confirmation lives in the /scaffold-app Claude skill;
+    # standalone runs read a confirmed config. No-op here keeps the
+    # orchestrator self-consistent.
+    log_info "standalone mode — confirmation prompts handled by /scaffold-app skill"
 }
 
 phase_create_target_dir() {
@@ -280,8 +323,144 @@ phase_create_target_dir() {
 }
 
 phase_abp_new() {
-    _phase_start "phase_abp_new (stub — unit-02)"
-    log_info "abp new invocation populates here in unit-02"
+    _phase_start "phase_abp_new"
+
+    # ABP version resolution: ABP_VERSION env / --abp-version flag wins.
+    # Otherwise autodetect from the locally-installed CLI. The resolved
+    # value is exported so unit-10's post-init banner can record it in
+    # the scaffolded CHANGELOG.md.
+    if [[ -z "${ABP_VERSION:-}" ]]; then
+        if ! command -v abp >/dev/null 2>&1; then
+            log_fail "abp CLI not found; install with 'dotnet tool install -g Volo.Abp.Studio.Cli'" \
+                "command -v abp"
+            return 1
+        fi
+        ABP_VERSION="$(abp --version 2>/dev/null | head -1 | awk '{print $NF}')"
+        if [[ -z "$ABP_VERSION" ]]; then
+            log_fail "could not detect abp version" "abp --version"
+            return 1
+        fi
+    fi
+    export ABP_VERSION
+    log_info "abp version: $ABP_VERSION"
+
+    # Resolve the target dir. `abp new` writes its output into the dir
+    # passed via --output-folder, so we use TARGET_DIR directly. The
+    # operator-supplied TARGET_DIR is empty per phase_create_target_dir.
+    # TARGET_PARENT_DIR is still exported for downstream units (overlay
+    # logic in unit-03+ may want the parent for sibling-file work).
+    local target_real
+    target_real="$(realpath "$TARGET_DIR")"
+    TARGET_PARENT_DIR="$(dirname "$target_real")"
+    export TARGET_PARENT_DIR
+
+    # Assemble flags. Bash array preserves quoting; we both exec it and
+    # (under --dry-run-abp-new) echo it for tests.
+    local -a flags=(
+        "$PROJECT_NAME"
+        "-t" "${ABP_TEMPLATE}"
+        "--ui-framework" "${ABP_UI}"
+        "--database-provider" "${ABP_DB_PROVIDER}"
+        "--database-management-system" "${ABP_DBMS}"
+        "--theme" "${ABP_THEME:-leptonx-lite}"
+        "--version" "${ABP_VERSION}"
+        "--skip-migration"
+        "--skip-migrator"
+        "--dont-run-install-libs"
+        "--dont-run-bundling"
+        "--without-cms-kit"
+        "--no-social-logins"
+        "-no-gdpr"
+        "-no-openiddict-admin-ui"
+        "-no-audit-logging"
+    )
+    # Multi-tenancy + separate-tenant-schema (only when ef + multi-tenancy).
+    if [[ "${ABP_MULTI_TENANCY}" == "true" ]]; then
+        if [[ "${ABP_DB_PROVIDER}" == "ef" ]]; then
+            flags+=("--separate-tenant-schema")
+        fi
+    else
+        flags+=("--no-multi-tenancy")
+    fi
+    # Tiered.
+    if [[ "${ABP_TIERED}" == "true" ]]; then
+        flags+=("--tiered")
+    fi
+    # Optional ABP modules: emit -no-<mod> for those NOT in the positive
+    # list. Positive modules are re-added via `abp install-module` AFTER
+    # `abp new` so the host module registers them.
+    local mod
+    for mod in file-management language-management text-template-management; do
+        if [[ ",${ABP_OPTIONAL_MODULES}," != *",${mod},"* ]]; then
+            flags+=("-no-${mod}")
+        fi
+    done
+    # Mobile [FIXED] off for v1.
+    flags+=("--mobile" "none")
+
+    # --dry-run-abp-new short-circuit for bats tests: emit the assembled
+    # flag array, one token per line, to stdout, then return success
+    # WITHOUT invoking abp.
+    if (( DRY_RUN_ABP_NEW == 1 )); then
+        printf 'ABP_NEW_FLAG: %s\n' "${flags[@]}"
+        log_ok "dry-run-abp-new: assembled ${#flags[@]} flag tokens"
+        return 0
+    fi
+
+    # Top-level --dry-run (unit-01 contract) ALSO skips abp invocation.
+    if (( DRY_RUN == 1 )); then
+        log_info "dry-run: would run: abp new ${flags[*]} --output-folder ${target_real}"
+        return 0
+    fi
+
+    # Real run. Capture combined stdout+stderr so we can both stream it
+    # AND inspect for the [ERR] marker — abp new sometimes logs ERR but
+    # exits 0 (e.g., "output folder is not empty"), so a process-exit
+    # check alone is insufficient. We also verify the .sln/.slnx file
+    # actually got written, which is the strongest success signal.
+    local out_log
+    out_log="$(mktemp -t scaffold-abp-new.XXXXXX.log)"
+    local abp_exit=0
+    abp new "${flags[@]}" --output-folder "${target_real}" \
+        > >(tee "$out_log") 2>&1 || abp_exit=$?
+
+    # Heuristic failure detection: process exit OR an [ERR] line OR no
+    # .sln/.slnx produced. Any of these means rollback + log_fail.
+    local sln_count
+    sln_count=$(find "$target_real" -maxdepth 3 \( -name '*.sln' -o -name '*.slnx' \) 2>/dev/null | wc -l)
+    if (( abp_exit != 0 )) || grep -q '\[ERR\]' "$out_log" || (( sln_count == 0 )); then
+        local last_err
+        last_err="$(grep -E '\[(ERR|FATAL)\]' "$out_log" | tail -n 1 | tr -d '\r')"
+        if [[ -z "$last_err" ]]; then
+            last_err="$(tail -n 1 "$out_log" | tr -d '\r')"
+        fi
+        rm -f "$out_log"
+        # Rollback: nuke the partial target dir.
+        rm -rf "$target_real"
+        log_fail "[step abp new] failed: ${last_err:-<no stderr captured>}" \
+            "abp new ${PROJECT_NAME}"
+        return 1
+    fi
+    rm -f "$out_log"
+
+    # Positive optional modules: re-add via `abp install-module` so the
+    # host module registers them. `abp new` already succeeded; on
+    # install-module failure we DO NOT roll back (the solution is valid,
+    # just missing one optional module — operator can inspect + retry).
+    if [[ -n "${ABP_OPTIONAL_MODULES}" ]]; then
+        local positive_mod
+        for positive_mod in ${ABP_OPTIONAL_MODULES//,/ }; do
+            [[ -z "$positive_mod" ]] && continue
+            log_info "abp install-module ${positive_mod}"
+            if ! ( cd "${target_real}" && abp install-module "$positive_mod" ); then
+                log_fail "abp install-module ${positive_mod} failed" \
+                    "abp install-module"
+                return 1
+            fi
+        done
+    fi
+
+    log_ok "abp new complete: ${target_real}"
 }
 
 phase_apply_overlays() {
