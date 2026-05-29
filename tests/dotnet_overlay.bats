@@ -82,7 +82,10 @@ EOF
     ! grep -q 'Include="Volo.Abp.AutoMapper"' "$f"
     ! grep -q 'Include="AutoMapper"' "$f"
     grep -q 'Include="Volo.Abp.Mapperly"' "$f"
-    grep -q 'Include="Riok.Mapperly.Abstractions"' "$f"
+    # Riok.Mapperly.Abstractions comes transitively from Volo.Abp.Mapperly —
+    # we DO NOT add it as a separate PackageReference (matches LinkHub
+    # canonical shape; explicit add caused NU1101 with packageSourceMapping).
+    ! grep -q 'Include="Riok.Mapperly.Abstractions"' "$f"
 }
 
 @test "dotnet_overlay_swap_automapper_for_mapperly is idempotent" {

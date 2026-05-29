@@ -459,9 +459,17 @@ dotnet_overlay_set_root_namespace() {
 # dotnet_overlay_swap_automapper_for_mapperly <csproj_file>
 #
 # Removes Volo.Abp.AutoMapper + AutoMapper PackageReference lines and
-# ensures Volo.Abp.Mapperly + Riok.Mapperly.Abstractions are present.
+# ensures Volo.Abp.Mapperly is present. The Volo.Abp.Mapperly package
+# transitively brings in Riok.Mapperly + Riok.Mapperly.Abstractions, so
+# no separate PackageReference is needed (matches the LinkHub canonical
+# csproj shape — verified at src/LinkHub.Application/LinkHub.Application.csproj
+# which only references Volo.Abp.Mapperly).
+#
 # Version pin for Volo.Abp.Mapperly comes from ${ABP_VERSION} (exported
-# by phase_abp_new). Riok.Mapperly.Abstractions stays on a stable 4.* pin.
+# by phase_abp_new). Operators MUST pass --abp-version <framework-version>
+# to scaffold.sh when ABP CLI's `abp --version` reports the Studio CLI
+# version (e.g. 3.0.2) rather than the framework version (e.g. 10.3.0);
+# downstream package resolution will fail with NU1605/NU1101 otherwise.
 dotnet_overlay_swap_automapper_for_mapperly() {
     local csproj="$1"
     if [[ ! -f "$csproj" ]]; then
@@ -470,25 +478,15 @@ dotnet_overlay_swap_automapper_for_mapperly() {
         return 1
     fi
     local abp_ver="${ABP_VERSION:-10.3.0}"
-    local riok_ver="${RIOK_MAPPERLY_VERSION:-4.*}"
 
     local tmp="${csproj}.mapperly.tmp"
     # Strip any AutoMapper/Volo.Abp.AutoMapper PackageReference lines.
-    # The trailing ORS-preserving filter keeps formatting; sed strips
-    # any line whose entire trimmed body is the PackageReference.
     sed -E '/<PackageReference[[:space:]]+Include="(Volo\.Abp\.AutoMapper|AutoMapper)"[^>]*\/>/d' \
         "$csproj" > "$tmp"
 
     # Ensure Volo.Abp.Mapperly is present.
     if ! grep -qE 'Include="Volo\.Abp\.Mapperly"' "$tmp"; then
         _csproj_add_packageref "$tmp" "Volo.Abp.Mapperly" "$abp_ver" || {
-            rm -f "$tmp"
-            return 1
-        }
-    fi
-    # Ensure Riok.Mapperly.Abstractions is present.
-    if ! grep -qE 'Include="Riok\.Mapperly\.Abstractions"' "$tmp"; then
-        _csproj_add_packageref "$tmp" "Riok.Mapperly.Abstractions" "$riok_ver" || {
             rm -f "$tmp"
             return 1
         }
@@ -684,13 +682,16 @@ dotnet_overlay_add_dependson_attribute() {
 
 # _ensure_using_line <cs_file> <using_line>
 # Inserts <using_line> after the last existing `using ...;` line if not
-# already present.
+# already present. CRLF-tolerant: a CRLF-terminated `using X;` in the
+# file matches an LF-terminated <using_line> arg.
 _ensure_using_line() {
     local cs="$1" using_line="$2"
     if [[ -z "$using_line" ]]; then
         return 0
     fi
-    if grep -qxF "$using_line" "$cs"; then
+    # Strip carriage returns for the presence check so CRLF-terminated
+    # lines compare equal to the LF caller arg.
+    if tr -d '\r' < "$cs" | grep -qxF "$using_line"; then
         return 0
     fi
     local tmp="${cs}.using.tmp"

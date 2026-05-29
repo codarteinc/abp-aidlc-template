@@ -197,7 +197,10 @@ teardown() {
     [ -f "$TARGET/src/SmokeApp.Application/SmokeAppApplicationMappers.cs" ]
     [ -f "$TARGET/src/SmokeApp.Domain/SmokeAppConsts.cs" ]
     [ -f "$TARGET/test/SmokeApp.TestBase/SmokeAppTestBase.cs" ]
-    [ -f "$TARGET/test/SmokeApp.TestBase/Data/SmokeAppTestDataSeedContributor.cs" ]
+    # NOTE: SmokeAppTestDataSeedContributor.cs is NOT shipped by this
+    # overlay — ABP CLI 3.0.2+ ships an equivalent file under
+    # test/SmokeApp.TestBase/SmokeAppTestDataBuilder.cs which would
+    # collide. Operators extend ABP's file directly.
     # No leftover .tmpl or .markers files.
     [ ! -f "$TARGET/.gitignore.tmpl" ]
     [ ! -f "$TARGET/.dockerignore.tmpl" ]

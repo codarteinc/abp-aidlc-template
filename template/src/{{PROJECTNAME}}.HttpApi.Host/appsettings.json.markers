@@ -4,6 +4,6 @@
 # pairs `"//scaffold-block-X-start": ""` immediately after the top-level
 # opening brace. ASP.NET Core's IConfiguration loader tolerates unknown
 # keys.
-ANCHOR ^\{$
+ANCHOR ^\{[[:space:]]*$
 BLOCK serilog-config
 BLOCK csp-defaults

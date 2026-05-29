@@ -4,7 +4,7 @@
 # ANCHOR (after-brace) targets the Main signature; marker lands inside
 # the method body after the Allman `{`, ahead of any vanilla CreateBuilder
 # wiring.
-ANCHOR ^[[:space:]]*public[[:space:]]+(static[[:space:]]+)?(async[[:space:]]+)?(Task<int>|int|Task)[[:space:]]+Main\(string\[\][[:space:]]+args\)[[:space:]]*$
+ANCHOR ^[[:space:]]*public[[:space:]].*[[:space:]]Main\(string\[\][[:space:]]+args\)[[:space:]]*$
 BLOCK serilog-bootstrap
 
 # After var builder = WebApplication.CreateBuilder(args); — use INLINE
