@@ -73,3 +73,48 @@ modules) does not require a paid license.
 without invoking the real `abp` binary, via the test-only
 `--dry-run-abp-new` flag. The flag is intentionally undocumented in
 `scaffold.sh --help`; operators never see it.
+
+## Claude Code + AI-DLC overlay (unit-09)
+
+The `template/.claude/` and `template/.ai-dlc/` trees ship the
+day-one Claude Code + AI-DLC config that every scaffolded repo
+inherits:
+
+- **`template/.claude/settings.json`** — enables the upstream
+  `ai-dlc`, `chrome-devtools-mcp`, `typescript-lsp`,
+  `frontend-design`, and `csharp-lsp` plugins. No skill enumeration
+  is needed; Claude Code auto-discovers any `.claude/skills/<name>/
+  SKILL.md` in the repo.
+- **`template/.claude/settings.local.json.template`** — per-
+  developer override stub. Operators copy it to
+  `.claude/settings.local.json` (gitignored) on first use.
+- **`template/.claude/skills/abp-*/SKILL.md`** — 18 ABP-specific
+  Claude skills bulk-copied verbatim from LinkHub. These are
+  reusable across any ABP project and freeze at scaffold release
+  time (operators update independently via plugin manager).
+- **`template/CLAUDE.md.tmpl`** — UI- and DB-conditional project
+  guide. UI-specific bullets (Angular proxy, MVC/Blazor wwwroot
+  libs, Vitest) only render when the matching UI is selected; the
+  EF Core migrations bullet only renders when `db_provider=ef` (a
+  MongoDB-specific bullet replaces it otherwise). LinkHub-specific
+  "Where things live" and "Runtime artifacts" sections are dropped
+  and replaced with placeholder blocks pointing operators at
+  LinkHub's CLAUDE.md as the canonical shape.
+- **`template/.ai-dlc/settings.yml.tmpl`** — UI-conditional AI-DLC
+  defaults. `default_passes` is `[product, dev]` for every UI value
+  except `ui=none`, which collapses to `[dev]` only (no UI surface
+  to design against).
+- **`template/.ai-dlc/ELABORATION.md.tmpl`** — generalized worktree
+  + ticket-sync rules. The yarn-install snippet inside the
+  worktree-secrets-copy block is `{{#if ui_angular}}`-wrapped.
+- **`template/.ai-dlc/knowledge/README.md`** — empty-on-day-one
+  marker, points operators at `/ai-dlc:elaborate` to synthesize the
+  knowledge artifacts on first deep run.
+
+`tests/overlay_claude_aidlc.bats` exercises the per-file rendering
+for `ui=angular,db=ef` (Angular section + EF migrations bullet
+present, MongoDB / MVC absent), `ui=mvc,db=mongodb` (Angular absent,
+MongoDB + wwwroot/libs present, EF migrations absent),
+`ui=none,db=mongodb` (no UI-conditional content at all), and
+asserts no LinkHub feature-specific residue beyond the two
+explicit reference links in the placeholder blocks.

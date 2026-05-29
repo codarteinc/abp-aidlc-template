@@ -1,0 +1,44 @@
+# .ai-dlc/settings.yml — defaults for /ai-dlc:* workflows in this
+# scaffolded repo. Per-intent overrides go in .ai-dlc/<intent>/
+# settings.yml.
+
+git:
+  change_strategy: intent
+  default_branch: main
+  auto_merge: true
+  elaboration_review: true
+
+visual_review: true
+
+{{#if ui_angular}}
+default_passes:
+  - product
+  - dev
+{{/if}}
+{{#if ui_mvc}}
+default_passes:
+  - product
+  - dev
+{{/if}}
+{{#if ui_blazor}}
+default_passes:
+  - product
+  - dev
+{{/if}}
+{{#if ui_blazor_server}}
+default_passes:
+  - product
+  - dev
+{{/if}}
+{{#if ui_none}}
+default_passes:
+  - dev
+{{/if}}
+
+default_announcements:
+  - changelog
+  - release-notes
+
+providers:
+  ticketing:
+    type: github-issues
