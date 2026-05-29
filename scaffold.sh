@@ -503,11 +503,19 @@ phase_apply_overlays() {
     #    d. cp -p the file (preserves mode/mtime; binary-safe — text
     #       substitution skips binaries via the file --mime sniff).
     #    e. Log the destination so operators see what was touched.
+    #
+    # Two prefixes are intentionally skipped:
+    #   - template/overlay-blocks/    — per-unit block-body fragments
+    #     consumed by step 6 (block injection). Sourced directly from
+    #     ${TEMPLATE_DIR}/overlay-blocks/<unit>/<block>.<ext>.frag.
+    #     Never lands in the scaffolded tree (operators shouldn't ship it).
     local src dst rendered_rel rel
     local -a applied_files=()
     while IFS= read -r -d '' src; do
         rel="${src#"$TEMPLATE_DIR"/}"
         [[ "$rel" == ".keep" ]] && continue
+        # Skip the overlay-blocks/ namespace — sourced directly by step 6.
+        [[ "$rel" == overlay-blocks/* ]] && continue
         rendered_rel="${rel//\{\{PROJECTNAME\}\}/${PROJECT_NAME}}"
         dst="${target_real}/${rendered_rel}"
         mkdir -p "$(dirname "$dst")"
@@ -519,13 +527,23 @@ phase_apply_overlays() {
     # 2. Substitute content. Per-suffix dispatch:
     #    - *.markers -> deferred to step 3.
     #    - *.tmpl    -> substitute_tmpl (drops .tmpl on success).
+    #    - *.template -> deploy-time envsubst targets; NO scaffold-time
+    #                    substitution (preserves ${DEPLOY_TIME_VAR}
+    #                    markers verbatim). The file is left in place
+    #                    with the .template suffix so deploy tooling
+    #                    (entrypoint scripts) can envsubst against it.
+    #    - *.frag    -> overlay-block content fragments; consumed by
+    #                    block injection in step 6 and not part of the
+    #                    scaffolded tree (skip here).
     #    - else      -> substitute_file (no-op on binaries).
     local f
     for f in "${applied_files[@]}"; do
         case "$f" in
-            *.markers) continue ;;
-            *.tmpl)    substitute_tmpl "$f" || return 1 ;;
-            *)         substitute_file "$f" || return 1 ;;
+            *.markers)  continue ;;
+            *.template) continue ;;
+            *.frag)     continue ;;
+            *.tmpl)     substitute_tmpl "$f" || return 1 ;;
+            *)          substitute_file "$f" || return 1 ;;
         esac
     done
 
@@ -568,6 +586,105 @@ phase_apply_overlays() {
         dotnet_overlay_add_dependson_attribute "$app_module" \
             "AbpMapperlyModule" "using Volo.Abp.Mapperly;" || return 1
         log_info "[overlay-dotnet] DependsOn(AbpMapperlyModule) -> ${app_module#"$target_real"/}"
+    fi
+
+    # 6. Block-body injection — splice content fragments into the empty
+    #    ScaffoldBlock marker pairs that step 3 created. Per-unit
+    #    fragments live under template/overlay-blocks/unit-NN/ with the
+    #    naming convention <block-name>.<target-suffix>.frag. The
+    #    target file is recovered from the suffix + a special-case for
+    #    serilog-bootstrap (which lives in Program.cs, not the host
+    #    module). The fragments themselves are NEVER copied to the
+    #    scaffolded tree (step 1 skips template/overlay-blocks/).
+    local host_module_path="${target_real}/src/${PROJECT_NAME}.HttpApi.Host/${PROJECT_NAME}HttpApiHostModule.cs"
+    local program_cs_path="${target_real}/src/${PROJECT_NAME}.HttpApi.Host/Program.cs"
+    local appsettings_path="${target_real}/src/${PROJECT_NAME}.HttpApi.Host/appsettings.json"
+    local block_name target_file frag_ext frag_base
+    local rendered_tmp
+    if [[ -d "${TEMPLATE_DIR}/overlay-blocks" ]]; then
+        local frag
+        while IFS= read -r -d '' frag; do
+            frag_base="${frag##*/}"               # otel.cs.frag
+            block_name="${frag_base%.*.frag}"     # otel
+            frag_ext="${frag_base%.frag}"
+            frag_ext="${frag_ext##*.}"            # cs
+            case "$frag_ext" in
+                cs)
+                    target_file="$host_module_path"
+                    # serilog-bootstrap lives in Program.cs.
+                    [[ "$block_name" == serilog-bootstrap ]] && target_file="$program_cs_path"
+                    ;;
+                json)
+                    target_file="$appsettings_path"
+                    ;;
+                *)
+                    log_fail "[overlay-dotnet] unknown frag ext: $frag" "block-inject"
+                    return 1
+                    ;;
+            esac
+            if [[ ! -f "$target_file" ]]; then
+                log_info "[overlay-dotnet] skip block '${block_name}' — target missing: ${target_file#"$target_real"/}"
+                continue
+            fi
+            # Render the fragment through envsubst so ${PROJECT_NAME} /
+            # ${PROJECT_NAME_LOWER} expand to the operator's project.
+            rendered_tmp="$(mktemp -t scaffold-frag.XXXXXX)"
+            cp -p "$frag" "$rendered_tmp"
+            substitute_file "$rendered_tmp" || {
+                rm -f "$rendered_tmp"
+                return 1
+            }
+            scaffold_insert_block "$target_file" "$block_name" "$rendered_tmp" || {
+                rm -f "$rendered_tmp"
+                return 1
+            }
+            rm -f "$rendered_tmp"
+            log_info "[overlay-dotnet] injected block '${block_name}' -> ${target_file#"$target_real"/}"
+        done < <(find "${TEMPLATE_DIR}/overlay-blocks" -type f -name '*.frag' -print0)
+    fi
+
+    # 7. unit-04 — ensure host-module usings for the OTel + health-checks
+    #    blocks (the splice itself only writes block bodies; using-lines
+    #    must be added separately). Idempotent.
+    if [[ -f "$host_module_path" ]]; then
+        local using_line
+        for using_line in \
+            "using ${PROJECT_NAME}.HealthChecks;" \
+            "using OpenTelemetry;" \
+            "using OpenTelemetry.Metrics;" \
+            "using OpenTelemetry.Resources;" \
+            "using OpenTelemetry.Trace;"
+        do
+            _ensure_using_line "$host_module_path" "$using_line" || return 1
+        done
+        log_info "[overlay-dotnet] OTel + HealthChecks using-lines ensured on host module"
+    fi
+
+    # 8. unit-04 — observability NuGet packages on the HttpApi.Host
+    #    csproj. Versions match LinkHub's current pins
+    #    (src/LinkHub.HttpApi.Host/LinkHub.HttpApi.Host.csproj as of
+    #    2026-05). Idempotent — re-adds are a no-op via
+    #    dotnet_overlay_add_package_reference's fast-path.
+    local host_csproj="${target_real}/src/${PROJECT_NAME}.HttpApi.Host/${PROJECT_NAME}.HttpApi.Host.csproj"
+    if [[ -f "$host_csproj" ]]; then
+        # Format: "<package-id>:<version>"
+        local pkg_spec
+        for pkg_spec in \
+            "OpenTelemetry.Extensions.Hosting:1.15.3" \
+            "OpenTelemetry.Instrumentation.AspNetCore:1.15.2" \
+            "OpenTelemetry.Instrumentation.Http:1.15.1" \
+            "OpenTelemetry.Instrumentation.EntityFrameworkCore:1.11.0-beta.2" \
+            "OpenTelemetry.Exporter.OpenTelemetryProtocol:1.15.3" \
+            "OpenTelemetry.Exporter.Prometheus.AspNetCore:1.11.2-beta.1" \
+            "Serilog.AspNetCore:9.0.0" \
+            "Serilog.Enrichers.Span:3.1.0" \
+            "Serilog.Sinks.Async:2.1.0"
+        do
+            local pkg_id="${pkg_spec%%:*}"
+            local pkg_ver="${pkg_spec#*:}"
+            dotnet_overlay_add_package_reference "$host_csproj" "$pkg_id" "$pkg_ver" || return 1
+        done
+        log_info "[overlay-dotnet] observability NuGet packages ensured on HttpApi.Host csproj"
     fi
 
     log_ok "overlay-dotnet applied"

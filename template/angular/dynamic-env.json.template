@@ -1,0 +1,35 @@
+{
+  "_comment": "Deploy-time envsubst target. Operators render this file at container start (e.g. via an entrypoint script that runs `envsubst < dynamic-env.json.template > dynamic-env.json`). The ${APP_*} variables below are deploy-time only; the scaffold tool intentionally leaves them unrendered. Set them via the deploy environment (docker run -e APP_SENTRY_DSN=..., k8s env, .env file, etc.). The committed sibling dynamic-env.json ships with REPLACE_ME_AT_DEPLOY so the SPA boots cleanly in dev without an envsubst pass.",
+  "application": {
+    "baseUrl": "${APP_BASE_URL}",
+    "name": "${APP_NAME}"
+  },
+  "apis": {
+    "default": {
+      "url": "${APP_API_URL}",
+      "rootNamespace": "${APP_ROOT_NAMESPACE}"
+    },
+    "AbpAccountPublic": {
+      "url": "${APP_OAUTH_ISSUER}",
+      "rootNamespace": "AbpAccountPublic"
+    }
+  },
+  "oAuthConfig": {
+    "issuer": "${APP_OAUTH_ISSUER}",
+    "redirectUri": "${APP_OAUTH_REDIRECT}",
+    "clientId": "${APP_OAUTH_CLIENT_ID}",
+    "responseType": "code",
+    "scope": "${APP_OAUTH_SCOPE}",
+    "requireHttps": true
+  },
+  "remoteEnv": {
+    "url": "/getEnvConfig",
+    "mergeStrategy": "deepmerge"
+  },
+  "errorReporting": {
+    "dsn": "${APP_SENTRY_DSN}",
+    "environment": "${APP_SENTRY_ENVIRONMENT}",
+    "release": "${APP_SENTRY_RELEASE}",
+    "tracesSampleRate": 0.1
+  }
+}

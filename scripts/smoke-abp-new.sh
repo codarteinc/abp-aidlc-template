@@ -94,4 +94,33 @@ if ! ( cd "$(dirname "$sln")" && dotnet build "$sln" > "${smoke_dir}/build.log" 
     exit 1
 fi
 
+# 4. unit-04 — spot-check the observability surface landed correctly in
+#    the scaffolded tree. Validates that the OTel + health-endpoints +
+#    Serilog blocks were spliced AND that the dotnet build above was
+#    actually exercising them (rather than a tree without the overlays).
+echo "--- observability surface spot-check (unit-04) ---"
+host_module="$(find "${smoke_dir}/SmokeApp" -type f -name 'SmokeAppHttpApiHostModule.cs' | head -1)"
+program_cs="$(find "${smoke_dir}/SmokeApp" -type f -name 'Program.cs' -path '*/SmokeApp.HttpApi.Host/*' | head -1)"
+appsettings_json="$(find "${smoke_dir}/SmokeApp" -type f -name 'appsettings.json' -path '*/SmokeApp.HttpApi.Host/*' | head -1)"
+host_csproj="$(find "${smoke_dir}/SmokeApp" -type f -name 'SmokeApp.HttpApi.Host.csproj' | head -1)"
+for needle in 'AddOpenTelemetry()' 'MapPrometheusScrapingEndpoint' 'AddSmokeAppHealthChecks' 'HealthChecksPolicyName' 'AddMeter("SmokeApp.*")'; do
+    if ! grep -qF "$needle" "$host_module"; then
+        echo "FAIL: host module missing observability needle '$needle'" >&2
+        exit 1
+    fi
+done
+if ! grep -qF '.Enrich.WithSpan()' "$program_cs"; then
+    echo "FAIL: Program.cs missing Serilog Enrich.WithSpan()" >&2
+    exit 1
+fi
+if ! grep -qF '[trace={TraceId} span={SpanId}]' "$appsettings_json"; then
+    echo "FAIL: appsettings.json missing [trace=... span=...] outputTemplate fragment" >&2
+    exit 1
+fi
+if ! grep -qF 'Include="OpenTelemetry.Extensions.Hosting"' "$host_csproj"; then
+    echo "FAIL: HttpApi.Host csproj missing OpenTelemetry.Extensions.Hosting" >&2
+    exit 1
+fi
+echo "OK: observability surfaces present"
+
 echo "OK: smoke test passed (solution at ${sln}; build log at ${smoke_dir}/build.log)"

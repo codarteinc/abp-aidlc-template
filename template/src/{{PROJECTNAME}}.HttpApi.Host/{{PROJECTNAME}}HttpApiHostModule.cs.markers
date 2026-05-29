@@ -5,14 +5,20 @@
 # inserted INSIDE the method body (after the Allman `{` line) via the
 # after-brace strategy in _insert_empty_marker_pair.
 
-# Inside ConfigureServices(...) — JSON loader hookup (secrets file).
+# Inside ConfigureServices(...) — JSON loader hookup (secrets file),
+# OTel + Prometheus + health-endpoint service registration (unit-04).
+# unit-04 owns: otel, health-endpoints.
+# unit-05 owns: secrets-json-loader.
 ANCHOR ^[[:space:]]*public override void ConfigureServices\(.*\)[[:space:]]*$
 BLOCK secrets-json-loader
-
-# Inside OnApplicationInitialization(...) — middleware wire-up.
-ANCHOR ^[[:space:]]*public override void OnApplicationInitialization\(.*\)[[:space:]]*$
 BLOCK otel
 BLOCK health-endpoints
+
+# Inside OnApplicationInitialization(...) — middleware wire-up (unit-05).
+# unit-05 owns: csp-middleware, hsts, openiddict-cert (placement of the
+# openiddict-cert block may move to PreConfigureServices per unit-05's
+# spec — unit-05 builder owns that re-anchor; unit-04 leaves it here).
+ANCHOR ^[[:space:]]*public override void OnApplicationInitialization\(.*\)[[:space:]]*$
 BLOCK csp-middleware
 BLOCK hsts
 BLOCK openiddict-cert

@@ -1,0 +1,8 @@
+{
+  "errorReporting": {
+    "dsn": "REPLACE_ME_AT_DEPLOY",
+    "environment": "development",
+    "release": "dev",
+    "tracesSampleRate": 0.1
+  }
+}

@@ -1,0 +1,22 @@
+# unit-04-overlay-observability — nginx /getEnvConfig location block.
+#
+# CROSS-UNIT HANDOFF — unit-06 (docker-compose / nginx / Caddy) owns
+# the angular/nginx.conf template as a whole. unit-04 ships this snippet
+# as a reference for the /getEnvConfig route; unit-06 splices the body
+# into nginx.conf alongside its own security-headers block.
+#
+# Behaviour: serves the static dynamic-env.json (the runtime config the
+# SPA reads at bootstrap via fetch('/getEnvConfig') — see
+# angular/src/main.ts + error-reporting/error-reporting.module.ts).
+# CORS headers are wide-open because the file is bootstrap-time SPA
+# config (not user data); changing Cache-Control to no-cache here is
+# operator's call.
+#
+# Mirrors the LinkHub canonical at angular/nginx.conf:57-63.
+location /getEnvConfig {
+    default_type 'application/json';
+    add_header 'Access-Control-Allow-Origin' '*' always;
+    add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+    add_header 'Content-Type' 'application/json';
+    try_files $uri /dynamic-env.json;
+}

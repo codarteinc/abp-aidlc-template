@@ -23,10 +23,20 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # Note: `grep` exits 1 when nothing matches. We tolerate that — it's the
 # normal case in unit-01 (empty `template/`). The `|| true` swallows the
 # non-zero so `set -e` doesn't fire on a benign empty result.
+#
+# Excludes:
+#   - *.template files — deploy-time envsubst targets; their ${VAR}
+#     references are operator-supplied at container start, NOT scaffold-
+#     time tokens. The scaffold's phase_apply_overlays skips substitution
+#     on *.template, so this script must match.
+#   - overlay-blocks/   — per-unit block-body fragments. Their ${VAR}
+#     references ARE scaffold-time (rendered before splicing into the
+#     marker pair), so they're INCLUDED in coverage (not excluded).
 # shellcheck disable=SC2016  # literal token-pattern; not a shell expansion.
 template_vars=$(
     if [[ -d template ]]; then
-        { grep -rho '\${[A-Z_]\+}' template/ 2>/dev/null || true; } \
+        { grep -rho --include='*' --exclude='*.template' \
+            '\${[A-Z_]\+}' template/ 2>/dev/null || true; } \
             | tr -d '${}' \
             | sort -u
     fi
