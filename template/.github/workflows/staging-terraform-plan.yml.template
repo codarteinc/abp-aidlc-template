@@ -1,0 +1,45 @@
+# .github/workflows/staging-terraform-plan.yml — staging wrapper around
+# the reusable `_terraform-plan.yml` template.
+#
+# Thin per-env wrapper: owns the `pull_request` trigger + path filter and
+# forwards staging's inputs (HCP workspace, working directory, operator
+# vars) to the reusable template. The actual plan logic — terraform
+# init/validate/plan, PR comment posting, artifact upload, defense-in-
+# depth secret masking — lives in `_terraform-plan.yml`.
+#
+# Path filter includes `terraform/modules/${PROJECT_NAME_LOWER}-env/**.tf`
+# and `**.tftpl` so a PR that edits the shared module's Terraform sources
+# or cloud-init template re-plans staging (and any future env). Non-source
+# files (README, .gitignore) in the module directory intentionally do NOT
+# trigger.
+#
+# Per-env duplication: to clone this wrapper for a new env (e.g.,
+# production), use:
+#   scripts/new-terraform-env.sh production
+# which copies this file → production-terraform-plan.yml and
+# sed-substitutes `staging` → `production`. See
+# docs/scaffold-runbook.md (Adding a new environment) for the full
+# procedure.
+
+name: Staging Terraform Plan
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/staging/**.tf'
+      - 'terraform/staging/**.tfvars'
+      - 'terraform/staging/.terraform.lock.hcl'
+      - 'terraform/modules/${PROJECT_NAME_LOWER}-env/**.tf'
+      - 'terraform/modules/${PROJECT_NAME_LOWER}-env/**.tftpl'
+
+jobs:
+  plan:
+    uses: ./.github/workflows/_terraform-plan.yml
+    with:
+      env_name: staging
+      tf_working_dir: terraform/staging
+      hcp_workspace: ${PROJECT_NAME_LOWER}-staging
+      pr_number: ${{ github.event.pull_request.number }}
+      ssh_allowed_cidrs: ${{ vars.STAGING_SSH_ALLOWED_CIDRS }}
+      operator_ssh_pubkeys: ${{ vars.STAGING_OPERATOR_SSH_PUBKEYS }}
+    secrets: inherit

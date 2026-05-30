@@ -365,4 +365,82 @@ fi
 
 echo "OK: unit-07 terraform-overlay surfaces present"
 
+# 8. Unit-08 github-workflows-overlay assertions.
+echo "--- unit-08 github-workflows assertions ---"
+
+# 8a. All 14 expected files present.
+declare -a workflow_files=(
+    ".github/dependabot.yml"
+    ".github/workflows/cicd.yml"
+    ".github/workflows/dependabot-auto-merge.yml"
+    ".github/workflows/runner-cache-cleanup.yml"
+    ".github/workflows/staging-deploy.yml"
+    ".github/workflows/staging-rollback.yml"
+    ".github/workflows/_terraform-apply.yml"
+    ".github/workflows/_terraform-plan.yml"
+    ".github/workflows/_terraform-drift.yml"
+    ".github/workflows/_terraform-destroy.yml"
+    ".github/workflows/staging-terraform-apply.yml"
+    ".github/workflows/staging-terraform-plan.yml"
+    ".github/workflows/staging-terraform-drift.yml"
+    ".github/workflows/staging-terraform-destroy.yml"
+)
+for f in "${workflow_files[@]}"; do
+    if [[ ! -f "${project_root}/${f}" ]]; then
+        echo "FAIL: workflow file missing: ${project_root}/${f}" >&2
+        exit 1
+    fi
+done
+
+# 8b. Every workflow YAML parses via yq.
+for f in "${workflow_files[@]}"; do
+    if ! yq eval '.' "${project_root}/${f}" > /dev/null 2>&1; then
+        echo "FAIL: ${f} not valid YAML (yq parse failed)" >&2
+        exit 1
+    fi
+done
+
+# 8c. No LinkHub / codarteinc residue.
+if grep -RIl -i 'linkhub\|codarteinc' "${project_root}/.github/" 2>/dev/null; then
+    echo "FAIL: LinkHub residue in ${project_root}/.github/" >&2
+    exit 1
+fi
+
+# 8d. cicd.yml references SmokeApp.slnx.
+if ! grep -q 'SmokeApp\.slnx' "${project_root}/.github/workflows/cicd.yml"; then
+    echo "FAIL: cicd.yml missing SmokeApp.slnx reference" >&2
+    exit 1
+fi
+
+# 8e. staging-deploy.yml references smokeapp-{api,web,dbmigrator}.
+for img in smokeapp-api smokeapp-web smokeapp-dbmigrator; do
+    if ! grep -q "${img}" "${project_root}/.github/workflows/staging-deploy.yml"; then
+        echo "FAIL: staging-deploy.yml missing image reference ${img}" >&2
+        exit 1
+    fi
+done
+
+# 8f. Concurrency-group contract — the 4 shared-group workflows.
+group_deploy=$(yq -r '.concurrency.group' "${project_root}/.github/workflows/staging-deploy.yml")
+group_rollback=$(yq -r '.concurrency.group' "${project_root}/.github/workflows/staging-rollback.yml")
+group_apply=$(yq -r '.jobs.apply.with.concurrency_group' "${project_root}/.github/workflows/staging-terraform-apply.yml")
+group_destroy=$(yq -r '.jobs.destroy.with.concurrency_group' "${project_root}/.github/workflows/staging-terraform-destroy.yml")
+if [[ "$group_deploy" != "smokeapp-staging-deploy" \
+   || "$group_rollback" != "smokeapp-staging-deploy" \
+   || "$group_apply" != "smokeapp-staging-deploy" \
+   || "$group_destroy" != "smokeapp-staging-deploy" ]]; then
+    echo "FAIL: concurrency-group drift: deploy=$group_deploy rollback=$group_rollback apply=$group_apply destroy=$group_destroy" >&2
+    exit 1
+fi
+
+# 8g. actionlint (if installed) clean.
+if command -v actionlint >/dev/null; then
+    if ! actionlint -no-color -shellcheck= "${project_root}/.github/workflows/"*.yml; then
+        echo "FAIL: actionlint reported errors" >&2
+        exit 1
+    fi
+fi
+
+echo "OK: unit-08 github-workflows surfaces present + structurally valid"
+
 echo "OK: smoke test passed (solution at ${sln}; build log at ${smoke_dir}/build.log)"

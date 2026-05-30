@@ -38,12 +38,14 @@ source "${LIB_DIR}/prompt.sh"
 source "${LIB_DIR}/substitute.sh"
 
 # Total number of orchestration phases. Bump as unit-10 adds real bodies.
-# 14 includes unit-05's phase_apply_security_overlay (inserted between
+# 15 includes unit-05's phase_apply_security_overlay (inserted between
 # phase_apply_overlays and phase_run_post_init_commands), unit-06's
 # phase_apply_docker_overlay (inserted between security overlay and
-# post-init), and unit-07's phase_apply_terraform_overlay (inserted
-# between docker overlay and post-init).
-STEP_TOTAL=14
+# post-init), unit-07's phase_apply_terraform_overlay (inserted between
+# docker overlay and post-init), and unit-08's
+# phase_apply_github_workflows_overlay (inserted between terraform
+# overlay and post-init).
+STEP_TOTAL=15
 STEP=0
 CURRENT_PHASE=""
 
@@ -782,6 +784,32 @@ phase_apply_terraform_overlay() {
     log_ok "overlay-terraform applied"
 }
 
+phase_apply_github_workflows_overlay() {
+    _phase_start "phase_apply_github_workflows_overlay"
+
+    # Dry-run short-circuit — phase_apply_overlays produced no target tree
+    # under --dry-run / --dry-run-abp-new.
+    if (( DRY_RUN == 1 )) || (( DRY_RUN_ABP_NEW == 1 )); then
+        log_info "[overlay-github-workflows] dry-run: skipping github-workflows overlay (no rendered tree)"
+        return 0
+    fi
+
+    if [[ -z "${TARGET_DIR:-}" || ! -d "$TARGET_DIR" ]]; then
+        log_warn "[overlay-github-workflows] TARGET_DIR not set or missing; skipping"
+        return 0
+    fi
+
+    # shellcheck source=lib/github-workflows-overlay.sh disable=SC1091
+    source "${LIB_DIR}/github-workflows-overlay.sh"
+
+    local target_real
+    target_real="$(realpath "$TARGET_DIR")"
+
+    github_workflows_overlay_render_templated_files "$target_real" || return 1
+
+    log_ok "overlay-github-workflows applied"
+}
+
 phase_run_post_init_commands() {
     _phase_start "phase_run_post_init_commands (stub — unit-10)"
     log_info "post-init commands populate here in unit-10"
@@ -811,6 +839,7 @@ main() {
     phase_apply_security_overlay
     phase_apply_docker_overlay
     phase_apply_terraform_overlay
+    phase_apply_github_workflows_overlay
     phase_run_post_init_commands
     phase_github_repo_init
     phase_handoff

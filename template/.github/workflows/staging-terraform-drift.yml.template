@@ -1,0 +1,40 @@
+# .github/workflows/staging-terraform-drift.yml — staging wrapper around
+# the reusable `_terraform-drift.yml` template.
+#
+# Thin per-env wrapper: owns the `schedule` cron + `workflow_dispatch`
+# triggers and forwards staging's inputs (env name, working dir, HCP
+# workspace, per-env drift label prefix) to the reusable template. The
+# actual drift logic — terraform plan with `-detailed-exitcode`, the
+# day-based dedup issue open/close, Discord embeds — lives in
+# `_terraform-drift.yml`.
+#
+# The `drift_label_prefix: infrastructure-drift-staging` value drives both
+# the GitHub issue label and the issue title prefix; per-env labels stop
+# multi-env drift from collapsing into one issue queue.
+#
+# Per-env duplication: to clone this wrapper for a new env (e.g.,
+# production), use:
+#   scripts/new-terraform-env.sh production
+# which copies this file → production-terraform-drift.yml and
+# sed-substitutes `staging` → `production`. See
+# docs/scaffold-runbook.md (Adding a new environment) for the full
+# procedure.
+
+name: Staging Terraform Drift
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  drift:
+    uses: ./.github/workflows/_terraform-drift.yml
+    with:
+      env_name: staging
+      tf_working_dir: terraform/staging
+      hcp_workspace: ${PROJECT_NAME_LOWER}-staging
+      drift_label_prefix: infrastructure-drift-staging
+      ssh_allowed_cidrs: ${{ vars.STAGING_SSH_ALLOWED_CIDRS }}
+      operator_ssh_pubkeys: ${{ vars.STAGING_OPERATOR_SSH_PUBKEYS }}
+    secrets: inherit

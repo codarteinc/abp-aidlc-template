@@ -1,0 +1,61 @@
+version: 2
+updates:
+  - package-ecosystem: nuget
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels: ["dependencies"]
+    groups:
+      abp-framework:
+        patterns: ["Volo.Abp.*"]
+      microsoft-aspnet:
+        patterns: ["Microsoft.AspNetCore.*", "Microsoft.Extensions.*"]
+      openiddict:
+        patterns: ["OpenIddict.*"]
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: npm
+    directory: "/angular"
+    schedule:
+      interval: weekly
+    labels: ["dependencies"]
+    groups:
+      angular:
+        patterns: ["@angular/*", "@angular-*"]
+      abp-angular:
+        patterns: ["@abp/ng.*"]
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "ci"]
+
+  - package-ecosystem: docker
+    directory: "/src"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "docker"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: docker
+    directory: "/angular"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "docker"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: terraform
+    directory: "/terraform/staging"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "terraform"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: terraform
+    directory: "/terraform/modules/${PROJECT_NAME_LOWER}-env"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "terraform"]
+    open-pull-requests-limit: 5

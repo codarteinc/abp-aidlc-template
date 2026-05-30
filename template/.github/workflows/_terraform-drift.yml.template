@@ -1,0 +1,436 @@
+# .github/workflows/_terraform-drift.yml — reusable drift-detection template.
+#
+# `workflow_call`-only. Per-env wrappers own the `schedule` cron trigger
+# (workflow_call workflows cannot themselves declare `schedule:` — that
+# trigger lives ONLY in the wrapper, e.g., staging-terraform-drift.yml)
+# and call this template with env-specific inputs.
+#
+# Substantively a parameterisation of today's `.github/workflows/
+# terraform-drift.yml` — every step, the PIPESTATUS gotcha, the
+# day-based dedup for drift / per-occurrence opens for errors, the
+# Discord embeds are preserved; only env-coupled strings (env name,
+# working dir, HCP workspace, drift-label prefix) are lifted to inputs.
+#
+# Design notes (don't "tidy up" without reading these):
+# - `issues: write` is the marginal scope vs. plan/apply workflows; the
+#   drift → issue is the audit surface this template owns.
+# - NO `concurrency:` group BY DESIGN. Drift detection is read-only and
+#   must be free to surface a problem WHILE a deploy or apply is mid-
+#   flight. A queued-behind-deploy drift signal defeats the purpose of
+#   the cron. The worst case of racing a `terraform apply` is one
+#   false-positive drift issue that auto-closes on the next clean run.
+# - Day-based dedup for drift issues (one issue per day, comments on
+#   subsequent same-day re-runs); NO dedup for error issues.
+# - NO Discord notification on the green/no-drift path — closing the
+#   open issue is signal enough.
+# - PIPESTATUS gotcha (plan step): the plan output pipes through `tee`
+#   which ALWAYS exits 0. A naive `$?` after the pipeline would capture
+#   tee's zero and silently break the 0/1/2 branching. We use
+#   `${PIPESTATUS[0]}` to read terraform's TRUE exit code.
+
+name: _terraform-drift
+
+# ─────────────────────────────────────────────────────────────────────
+# RUNNER NOTE — this workflow ships defaulting to `runs-on: self-hosted`.
+#
+# To run on GitHub-hosted infrastructure instead:
+#   1. Replace every `runs-on: self-hosted` line in this file with
+#      `runs-on: ubuntu-latest`.
+#   2. (If applicable) delete .github/workflows/runner-cache-cleanup.yml
+#      entirely — it only manages a self-hosted runner's local cache.
+#   3. See docs/scaffold-runbook.md → "Switching from self-hosted to
+#      GitHub-hosted runners" for the full migration steps.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      env_name:
+        description: 'Environment name (e.g., staging, staging2).'
+        type: string
+        required: true
+      tf_working_dir:
+        description: 'Terraform working directory (e.g., terraform/staging).'
+        type: string
+        required: true
+      hcp_workspace:
+        description: 'HCP Terraform workspace name (e.g., ${PROJECT_NAME_LOWER}-staging) — surfaced in issue bodies + Discord embeds for operator clarity.'
+        type: string
+        required: true
+      concurrency_group:
+        description: 'Accepted for input-shape parity across templates; this template intentionally takes NO concurrency lock (drift must surface during a deploy).'
+        type: string
+        required: false
+        default: ''
+      ssh_allowed_cidrs:
+        description: 'JSON-encoded list of CIDRs for the VM firewall SSH allow-list. Forwarded as TF_VAR_ssh_allowed_cidrs.'
+        type: string
+        required: true
+      operator_ssh_pubkeys:
+        description: 'JSON-encoded map (name → ssh-key) of operator pubkeys. Forwarded as TF_VAR_operator_ssh_pubkeys.'
+        type: string
+        required: true
+      drift_label_prefix:
+        description: 'Per-env drift label/title prefix (e.g., infrastructure-drift-staging). Plan errors use `<prefix>-error` for both the label and the title prefix.'
+        type: string
+        required: true
+
+# Intentionally NO `concurrency:` block — see header. Drift must surface
+# during a deploy, not queue behind it.
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    runs-on: self-hosted
+    environment: ${{ inputs.env_name }}
+    timeout-minutes: 15
+    env:
+      TF_VAR_hcloud_token:         ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+      TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Pre-flight gh CLI check
+        run: |
+          set -euo pipefail
+          command -v gh >/dev/null 2>&1 || { echo "::error::gh CLI not installed on runner"; exit 1; }
+
+      - name: Defense-in-depth secret masking
+        env:
+          HCP_TF_TOKEN:        ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:        ${{ secrets.HCLOUD_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # No `set -x` here — never trace this step's shell.
+          set -euo pipefail
+          echo "::add-mask::$HCP_TF_TOKEN"
+          echo "::add-mask::$HCLOUD_TOKEN"
+          if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "::add-mask::$DISCORD_WEBHOOK_URL"
+          fi
+
+      - name: Setup terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          # Matches required_version = "~> 1.10" in env root's versions.tf.
+          terraform_version: '1.10.5'
+          terraform_wrapper: false
+
+      - name: terraform init
+        id: tf-init
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:              ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false -no-color
+
+      - name: terraform plan -detailed-exitcode
+        id: tf-plan
+        working-directory: ${{ inputs.tf_working_dir }}
+        continue-on-error: true
+        shell: bash
+        env:
+          TF_TOKEN_app_terraform_io:   ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:                ${{ secrets.HCLOUD_TOKEN }}
+          # JSON-encoded list/map inputs reach Terraform via TF_VAR_*.
+          TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+          TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+        run: |
+          # `tee` ALWAYS exits 0 — read terraform's TRUE exit code from
+          # PIPESTATUS[0] (the first element of the pipeline). Do NOT
+          # replace with `$?` — it would capture tee's zero and break
+          # the 0/1/2 branching downstream. See header note.
+          terraform plan -input=false -no-color -detailed-exitcode -out=tfplan.bin 2>&1 | tee tfplan.txt
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          echo "::notice::terraform plan exit code: $EXIT (0=clean, 1=error, 2=drift)"
+
+      - name: Truncate plan output
+        shell: bash
+        env:
+          TF_WORKING_DIR: ${{ inputs.tf_working_dir }}
+        run: |
+          set -euo pipefail
+          SRC="${TF_WORKING_DIR}/tfplan.txt"
+          DST="${TF_WORKING_DIR}/tfplan-truncated.txt"
+          # If the plan never wrote (e.g., init failed and step skipped),
+          # produce a placeholder so downstream steps don't fail on read.
+          if [[ ! -f "$SRC" ]]; then
+            echo "(no plan output captured — see workflow run log)" > "$DST"
+          else
+            LEN=$(wc -c < "$SRC")
+            if [[ "$LEN" -gt 60000 ]]; then
+              {
+                head -c 25000 "$SRC"
+                printf '\n[... output truncated, see workflow run %s ...]\n' "${GITHUB_RUN_ID}"
+                tail -c 25000 "$SRC"
+              } > "$DST"
+            else
+              cp "$SRC" "$DST"
+            fi
+          fi
+          # Export for downstream issue-body + Discord-payload steps.
+          {
+            echo "PLAN_TRUNCATED<<__PLAN_EOF__"
+            cat "$DST"
+            echo "__PLAN_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Compute today's UTC date
+        id: date
+        run: |
+          set -euo pipefail
+          DATE_UTC=$(date -u +%Y-%m-%d)
+          echo "date_utc=$DATE_UTC" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # EXIT 0 — no drift. Close any open drift issue for this env.
+      # GitHub Actions step outputs are STRINGS — gate on '0' literal.
+      # ---------------------------------------------------------------
+      - name: Resolve drift issue (exit 0 — no drift)
+        if: steps.tf-plan.outputs.exit_code == '0'
+        env:
+          GH_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+          REPO:               ${{ github.repository }}
+          RUN_ID:             ${{ github.run_id }}
+          SERVER:             ${{ github.server_url }}
+          DATE_UTC:           ${{ steps.date.outputs.date_utc }}
+          DRIFT_LABEL_PREFIX: ${{ inputs.drift_label_prefix }}
+        run: |
+          set -euo pipefail
+          # Close ALL open drift issues for this env (label-scoped). The
+          # day-based dedup keeps the open-issue count at one in steady
+          # state, but if a prior day's issue stayed open OR an operator
+          # opened a manual drift issue, we want every one closed on a
+          # clean check — otherwise stale issues linger forever.
+          mapfile -t OPEN_ISSUES < <(gh issue list \
+            --repo "$REPO" \
+            --label "$DRIFT_LABEL_PREFIX" \
+            --state open \
+            --json number \
+            --jq '.[].number')
+          if [[ ${#OPEN_ISSUES[@]} -gt 0 ]]; then
+            TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            RUN_URL="$SERVER/$REPO/actions/runs/$RUN_ID"
+            RESOLVED_BODY=$(printf 'Drift resolved at %s (UTC date: %s).\n\nWorkflow run: %s\n' \
+              "$TS" "$DATE_UTC" "$RUN_URL")
+            for ISSUE in "${OPEN_ISSUES[@]}"; do
+              gh issue comment "$ISSUE" --repo "$REPO" --body "$RESOLVED_BODY"
+              gh issue close   "$ISSUE" --repo "$REPO" --reason completed
+              echo "::notice::Closed drift issue #$ISSUE — state matches reality."
+            done
+          else
+            echo "::notice::No open ${DRIFT_LABEL_PREFIX} issue — nothing to close."
+          fi
+
+      # ---------------------------------------------------------------
+      # EXIT 2 — drift detected. Day-based dedup → issue, then yellow
+      # Discord notification.
+      # ---------------------------------------------------------------
+      - name: Open or update drift issue (exit 2 — drift)
+        id: drift_issue
+        if: steps.tf-plan.outputs.exit_code == '2'
+        env:
+          GH_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+          REPO:               ${{ github.repository }}
+          RUN_ID:             ${{ github.run_id }}
+          SERVER:             ${{ github.server_url }}
+          DATE_UTC:           ${{ steps.date.outputs.date_utc }}
+          DRIFT_LABEL_PREFIX: ${{ inputs.drift_label_prefix }}
+          HCP_WORKSPACE:      ${{ inputs.hcp_workspace }}
+          # PLAN_TRUNCATED arrives via GITHUB_ENV from the truncate step.
+        run: |
+          set -euo pipefail
+          RUN_URL="$SERVER/$REPO/actions/runs/$RUN_ID"
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TITLE_PREFIX="[${DRIFT_LABEL_PREFIX}]"
+          ISSUE_TITLE="${TITLE_PREFIX} ${DATE_UTC}: drift detected in ${HCP_WORKSPACE}"
+          DRIFT_BODY=$(cat <<EOF
+          Drift detected at $TS (UTC date: $DATE_UTC) in workspace \`${HCP_WORKSPACE}\`.
+
+          Workflow run: $RUN_URL
+
+          <details>
+          <summary>terraform plan output (truncated to 60k chars)</summary>
+
+          \`\`\`
+          $PLAN_TRUNCATED
+          \`\`\`
+          </details>
+
+          Triage: see \`docs/staging-runbook.md\` §13.
+          EOF
+          )
+          # Search for today's open issue scoped to this env's label,
+          # dedup by date-prefixed title.
+          TODAY_ISSUE=$(gh issue list \
+            --repo "$REPO" \
+            --label "$DRIFT_LABEL_PREFIX" \
+            --state open \
+            --search "in:title ${TITLE_PREFIX} ${DATE_UTC}" \
+            --json number \
+            --jq '.[0].number // empty')
+          if [[ -n "$TODAY_ISSUE" ]]; then
+            gh issue comment "$TODAY_ISSUE" --repo "$REPO" --body "$DRIFT_BODY"
+            ISSUE_NUMBER="$TODAY_ISSUE"
+            echo "::notice::Commented on existing drift issue #$ISSUE_NUMBER (day-dedup)."
+          else
+            ISSUE_URL=$(gh issue create \
+              --repo "$REPO" \
+              --label "$DRIFT_LABEL_PREFIX" \
+              --title "$ISSUE_TITLE" \
+              --body "$DRIFT_BODY")
+            ISSUE_NUMBER="${ISSUE_URL##*/}"
+            echo "::notice::Opened new drift issue #$ISSUE_NUMBER at $ISSUE_URL"
+          fi
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Discord notify drift (yellow)
+        if: steps.tf-plan.outputs.exit_code == '2'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REPO:                ${{ github.repository }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          SERVER:              ${{ github.server_url }}
+          DATE_UTC:            ${{ steps.date.outputs.date_utc }}
+          ISSUE_NUMBER:        ${{ steps.drift_issue.outputs.issue_number }}
+          ENV_NAME:            ${{ inputs.env_name }}
+          HCP_WORKSPACE:       ${{ inputs.hcp_workspace }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          RUN_URL="$SERVER/$REPO/actions/runs/$RUN_ID"
+          ISSUE_URL="$SERVER/$REPO/issues/$ISSUE_NUMBER"
+          payload=$(jq -n \
+            --arg title "Infrastructure drift detected" \
+            --arg env "$ENV_NAME" \
+            --arg workspace "$HCP_WORKSPACE" \
+            --arg date "$DATE_UTC" \
+            --arg run_md "[#${RUN_NUMBER}](${RUN_URL})" \
+            --arg issue_md "[#${ISSUE_NUMBER}](${ISSUE_URL})" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 15844367,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Workspace",   value: $workspace, inline: true},
+                  {name: "Date (UTC)",  value: $date, inline: true},
+                  {name: "Issue",       value: $issue_md},
+                  {name: "Run",         value: $run_md}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          # `|| true` — a Discord outage must NEVER fail the drift step.
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      # ---------------------------------------------------------------
+      # EXIT 1 — terraform error. NO dedup (every error opens a fresh
+      # issue) + red Discord notification.
+      # ---------------------------------------------------------------
+      - name: Open error issue (exit 1 — terraform error)
+        id: error_issue
+        if: steps.tf-plan.outputs.exit_code == '1'
+        env:
+          GH_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+          REPO:               ${{ github.repository }}
+          RUN_ID:             ${{ github.run_id }}
+          SERVER:             ${{ github.server_url }}
+          DATE_UTC:           ${{ steps.date.outputs.date_utc }}
+          DRIFT_LABEL_PREFIX: ${{ inputs.drift_label_prefix }}
+          HCP_WORKSPACE:      ${{ inputs.hcp_workspace }}
+          # PLAN_TRUNCATED arrives via GITHUB_ENV from the truncate step.
+        run: |
+          set -euo pipefail
+          RUN_URL="$SERVER/$REPO/actions/runs/$RUN_ID"
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          ERROR_LABEL="${DRIFT_LABEL_PREFIX}-error"
+          ERROR_TITLE_PREFIX="[${ERROR_LABEL}]"
+          ISSUE_TITLE="${ERROR_TITLE_PREFIX} ${DATE_UTC}: terraform plan failed in ${HCP_WORKSPACE}"
+          ERROR_BODY=$(cat <<EOF
+          \`terraform plan\` failed at $TS (UTC date: $DATE_UTC) in workspace \`${HCP_WORKSPACE}\`.
+
+          Workflow run: $RUN_URL
+
+          <details>
+          <summary>terraform plan output (truncated to 60k chars)</summary>
+
+          \`\`\`
+          $PLAN_TRUNCATED
+          \`\`\`
+          </details>
+
+          Triage: see \`docs/staging-runbook.md\` §13. Common causes:
+          HCP token revoked / rotated, Hetzner Cloud API outage,
+          provider version mismatch.
+          EOF
+          )
+          ISSUE_URL=$(gh issue create \
+            --repo "$REPO" \
+            --label "$ERROR_LABEL" \
+            --title "$ISSUE_TITLE" \
+            --body "$ERROR_BODY")
+          ISSUE_NUMBER="${ISSUE_URL##*/}"
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "::notice::Opened error issue #$ISSUE_NUMBER at $ISSUE_URL"
+
+      - name: Discord notify error (red)
+        if: steps.tf-plan.outputs.exit_code == '1'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REPO:                ${{ github.repository }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          SERVER:              ${{ github.server_url }}
+          DATE_UTC:            ${{ steps.date.outputs.date_utc }}
+          ISSUE_NUMBER:        ${{ steps.error_issue.outputs.issue_number }}
+          ENV_NAME:            ${{ inputs.env_name }}
+          HCP_WORKSPACE:       ${{ inputs.hcp_workspace }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          RUN_URL="$SERVER/$REPO/actions/runs/$RUN_ID"
+          ISSUE_URL="$SERVER/$REPO/issues/$ISSUE_NUMBER"
+          payload=$(jq -n \
+            --arg title "Terraform plan failed (drift check)" \
+            --arg env "$ENV_NAME" \
+            --arg workspace "$HCP_WORKSPACE" \
+            --arg date "$DATE_UTC" \
+            --arg run_md "[#${RUN_NUMBER}](${RUN_URL})" \
+            --arg issue_md "[#${ISSUE_NUMBER}](${ISSUE_URL})" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 15158332,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Workspace",   value: $workspace, inline: true},
+                  {name: "Date (UTC)",  value: $date, inline: true},
+                  {name: "Issue",       value: $issue_md},
+                  {name: "Run",         value: $run_md}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true

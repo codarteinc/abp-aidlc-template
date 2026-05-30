@@ -1,0 +1,152 @@
+name: Runner cache cleanup
+#
+# Weekly + on-demand maintenance for the self-hosted runner's local caches.
+# Caps `$HOME/.nuget/packages` and the BuildKit cache total well under 15 GB so
+# the cx23's filesystem doesn't fill over time. The first build after a
+# cleanup wave will be one cache-miss slower (NuGet restore + BuildKit
+# layer downloads) — see docs/scaffold-runbook.md for the operator playbook
+# and the on-demand escape hatch.
+#
+# ─────────────────────────────────────────────────────────────────────
+# RUNNER NOTE — this workflow ships defaulting to `runs-on: self-hosted`.
+#
+# To run on GitHub-hosted infrastructure instead — or, more correctly,
+# to retire this file entirely:
+#   1. This workflow ONLY manages a self-hosted runner's local cache. It
+#      has NO purpose on GitHub-hosted runners (which are ephemeral and
+#      reset between jobs). If you do NOT have a self-hosted runner,
+#      delete this file entirely: `rm .github/workflows/runner-cache-cleanup.yml`.
+#   2. If you DO migrate the rest of the CICD pipeline to GitHub-hosted
+#      runners (cicd.yml, staging-deploy.yml, etc.) but still have a
+#      self-hosted runner for some niche reason, leave this file in
+#      place — it'll keep that runner's cache trimmed.
+#   3. See docs/scaffold-runbook.md → "Switching from self-hosted to
+#      GitHub-hosted runners" for the full migration steps.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # Sunday 04:00 UTC. Low-traffic time on this repo.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      nuget_force_clear:
+        description: 'Wipe $HOME/.nuget/packages regardless of size'
+        type: boolean
+        default: false
+      buildkit_keep_storage_gb:
+        description: 'BuildKit keep-storage cap in GB (default 10)'
+        type: string
+        default: '10'
+
+# Cleanup's own concurrency group — does NOT share CICD's `cicd-CICD` group.
+# Sharing was tempting (it would block cleanup from running mid-CICD-pipeline)
+# but GitHub Actions' "1 running + 1 pending per group, third entry cancels
+# the previously-pending" rule means cleanup queuing would also cancel any
+# pending CICD run in that group. Observed during the first deploy of
+# this workflow upstream: a merge to main with CICD #A in-progress +
+# CICD #B queued + this cleanup dispatched → cleanup landing in the
+# group cancelled CICD #B.
+#
+# Instead, rely on the self-hosted runner being single-slot: CICD jobs and
+# cleanup jobs queue FIFO at the RUNNER level. They serialize automatically
+# without any workflow-concurrency coordination. The narrow race window
+# (cleanup landing between two CICD jobs while a build is mid-step) is
+# tolerated because:
+#   - `docker buildx prune --keep-storage` skips entries BuildKit knows are
+#     in use (in-flight builds are safe).
+#   - The NuGet rm -rf only fires when total > 5 GB (rare); if it lands
+#     mid-restore the worst case is one failed step → retry → cache miss
+#     repopulates from actions/cache (~15 s overhead).
+concurrency:
+  group: runner-cache-cleanup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: Prune NuGet + BuildKit caches on the self-hosted runner
+    runs-on: self-hosted
+    timeout-minutes: 15
+    env:
+      # Hard cap (combined). NuGet cap is half — BuildKit gets the other
+      # half. Both numbers are intentionally conservative; the goal is
+      # ≤15 GB combined.
+      NUGET_CAP_GB: 5
+      BUILDKIT_KEEP_GB: ${{ github.event.inputs.buildkit_keep_storage_gb || '10' }}
+    steps:
+      - name: Pre-cleanup disk report
+        run: |
+          set -u
+          echo "## Pre-cleanup disk usage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          df -h / 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -d "$HOME/.nuget/packages" ]; then
+            du -sh "$HOME/.nuget/packages" 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "$HOME/.nuget/packages: not present" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          docker system df 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trim $HOME/.nuget/packages if over cap
+        env:
+          NUGET_FORCE_CLEAR: ${{ github.event.inputs.nuget_force_clear || 'false' }}
+        run: |
+          set -u
+          NUGET_DIR="$HOME/.nuget/packages"
+          if [ ! -d "$NUGET_DIR" ]; then
+            echo "$HOME/.nuget/packages does not exist — nothing to do."
+            exit 0
+          fi
+          SIZE_KB=$(du -sk "$NUGET_DIR" 2>/dev/null | cut -f1)
+          SIZE_GB=$(( SIZE_KB / 1024 / 1024 ))
+          echo "Current $HOME/.nuget/packages size: ${SIZE_GB} GB (cap: ${NUGET_CAP_GB} GB)"
+          if [ "$NUGET_FORCE_CLEAR" = "true" ] || [ "$SIZE_GB" -gt "$NUGET_CAP_GB" ]; then
+            echo "Clearing $HOME/.nuget/packages (force=${NUGET_FORCE_CLEAR}, over_cap=$([ "$SIZE_GB" -gt "$NUGET_CAP_GB" ] && echo true || echo false))"
+            rm -rf "$NUGET_DIR"
+            mkdir -p "$NUGET_DIR"
+            echo "Cleared. actions/cache will repopulate on the next CICD run." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Under cap — leaving in place."
+          fi
+
+      - name: Prune BuildKit cache (build + exec cache mounts)
+        run: |
+          set -u
+          KEEP_STORAGE="${BUILDKIT_KEEP_GB}GB"
+          echo "BuildKit keep-storage cap: ${KEEP_STORAGE}"
+          # Prune general buildkit cache first (layers, exec mounts, etc.)
+          docker buildx prune --keep-storage="${KEEP_STORAGE}" --force 2>&1 | tee /tmp/buildx-prune.log
+          {
+            echo "## BuildKit prune output"
+            echo '```'
+            tail -20 /tmp/buildx-prune.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prune dangling Docker images + stopped containers
+        run: |
+          set -u
+          # Free obvious garbage. `-f` is the non-volume variant of system prune.
+          docker container prune --force --filter "until=72h" 2>&1 | tail -10
+          docker image prune --force --filter "until=168h" 2>&1 | tail -10
+
+      - name: Post-cleanup disk report
+        if: always()
+        run: |
+          set -u
+          {
+            echo "## Post-cleanup disk usage"
+            echo '```'
+            df -h / 2>&1
+            echo ''
+            if [ -d "$HOME/.nuget/packages" ]; then
+              du -sh "$HOME/.nuget/packages" 2>/dev/null || true
+            fi
+            docker system df 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

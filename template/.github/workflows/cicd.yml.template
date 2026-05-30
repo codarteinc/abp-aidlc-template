@@ -1,0 +1,577 @@
+# CICD — single source of truth for build, test, dependency audit, and image publish.
+#
+# Consolidates a separate `ci.yml` (dotnet build/test + Angular lint/test/build +
+# dependency audit) and `docker-publish.yml` (per-service GHCR image builds) into
+# one sequential pipeline so that:
+#   1. Build & Test runs on every PR + every push to main + every per-service tag.
+#   2. The Docker publish jobs gate on Build & Test passing — we never push an
+#      image from a commit whose tests failed.
+#   3. The status UI shows a single workflow per commit rather than two parallel
+#      workflows whose results can disagree.
+#
+# Job graph:
+#
+#   Build & Test ──┬─► Detect changed paths ──┬─► Build & Push API ──────────┐
+#                  │                          ├─► Build & Push DbMigrator ──┼─► Summary
+#                  │                          └─► Build & Push Web ─────────┘
+#                  │
+#                  └─► (independent) Dependency Audit (Critical-only, non-blocking)
+#
+# Adversarial-pass notes:
+#   - permissions: block is least-privilege. `contents: read` is enough for
+#     actions/checkout to fetch source; `packages: write` is required by
+#     docker/login-action -> GHCR push. `id-token: none` is explicit so we
+#     don't silently grant Sigstore/Cosign keyless capability (a future
+#     security pass will set this to `write` when wiring image signing).
+#   - `pull_request:` trigger fires Build & Test (and Dependency Audit) only —
+#     the image publish jobs are gated on `github.event_name == 'push'` so fork
+#     PRs cannot reach `secrets.GITHUB_TOKEN` write scopes nor execute the
+#     registry-write code path on attacker-controlled refs.
+#   - concurrency.group is keyed on the workflow name (NOT on the ref) so all
+#     CICD runs serialize against the single self-hosted runner. This prevents
+#     Dependabot / feature-branch PRs from cutting in line and grabbing the
+#     runner between jobs of an in-flight main push.
+#     cancel-in-progress is FALSE here — because the group now spans all refs,
+#     any truthy value would let a main push cancel an in-flight PR or tag
+#     release. Two rapid main pushes both run sequentially (the newer `:main`
+#     tag still wins on GHCR). The single-group constraint can be relaxed back
+#     to per-ref (and cancel-in-progress restored) once the runner pool grows
+#     past one slot.
+#   - Build cache is per-image (each service has its own `:buildcache` tag on
+#     its own image repo). A poisoned cache for one image cannot bleed into
+#     the others. Cache reads use `mode=max` to maximise layer reuse but the
+#     buildkit cache manifest is content-addressed by layer digest, so a
+#     compromised layer surfaces as a different digest and breaks the build
+#     rather than silently propagating.
+#   - Action versions are pinned to MAJOR only (`@v3`, `@v5`, `@v6`, `@v7`).
+#     Pinning by commit SHA is a stronger supply-chain control but is explicitly
+#     deferred to a future security pass. Operators should monitor security
+#     advisories for these actions:
+#       - dorny/paths-filter
+#       - docker/login-action
+#       - docker/setup-buildx-action
+#       - docker/metadata-action
+#       - docker/build-push-action
+#       - actions/checkout
+#       - actions/setup-dotnet
+#       - actions/setup-node
+#       - actions/upload-artifact
+#     and bump or SHA-pin if a CVE is announced.
+#   - `provenance: false` + `sbom: false` on build-push-action: BuildKit
+#     provenance attestations + SBOM emission are deferred to the security pass
+#     (companion to Cosign signing). Leaving them off avoids the registry
+#     attestation manifest format, which some downstream tools don't grok yet.
+#   - `${{ }}` interpolations into `run:` shell blocks always go through `env:`
+#     not into shell args (script-injection hardening).
+#
+# ─────────────────────────────────────────────────────────────────────
+# RUNNER NOTE — this workflow ships defaulting to `runs-on: self-hosted`.
+#
+# To run on GitHub-hosted infrastructure instead:
+#   1. Replace every `runs-on: self-hosted` line in this file with
+#      `runs-on: ubuntu-latest`.
+#   2. (If applicable) delete .github/workflows/runner-cache-cleanup.yml
+#      entirely — it only manages a self-hosted runner's local cache and
+#      has no purpose on GitHub-hosted runners.
+#   3. Re-review concurrency-group semantics: the scaffold-shipped single-
+#      slot serialization across CICD jobs assumes ONE self-hosted runner.
+#      On GitHub-hosted infrastructure you have a parallel pool, so the
+#      cross-ref concurrency in cicd.yml (group keyed only on workflow
+#      name) becomes overly serializing. Consider switching to
+#      `cicd-${{ github.workflow }}-${{ github.ref }}` for per-ref
+#      serialization once you're on GitHub-hosted runners.
+#   4. See docs/scaffold-runbook.md → "Switching from self-hosted to
+#      GitHub-hosted runners" for the full migration steps.
+# ─────────────────────────────────────────────────────────────────────
+
+name: CICD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags:
+      - 'api-v*'
+      - 'web-v*'
+      - 'migrator-v*'
+  # Manual escape hatch: republish all 3 images on HEAD regardless of the
+  # path filter. Use when a series of infra-only commits (terraform, docs,
+  # workflows) have left HEAD without GHCR images, but the deploy workflow
+  # needs to deploy HEAD anyway.
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Republish ALL 3 images (api, dbmigrator, web), bypassing the path filter'
+        type: boolean
+        default: true
+
+# Serialize ALL CICD runs against the single self-hosted runner (group keyed on
+# workflow name only, not on ref). Without this, PRs from other branches —
+# notably Dependabot — pick up the runner between jobs of an in-flight main
+# push, delaying the main pipeline by several minutes. See the header notes for
+# the full rationale and the relaxation path once the runner pool grows.
+#
+# cancel-in-progress is FALSE: with the group keyed across all refs, any truthy
+# value here would let a main push cancel an in-flight PR or tag-release run
+# (cross-ref cancellation), which is unwanted. The cost of `false` is that two
+# rapid main pushes within one CICD duration both run sequentially instead of
+# the newer cancelling the older — rare in practice, and the newer `:main` tag
+# correctly overwrites the older on GHCR either way.
+concurrency:
+  group: cicd-${{ github.workflow }}
+  cancel-in-progress: false
+
+# Minimum required permissions. `packages: write` is needed by the image-publish
+# jobs; granting it at workflow scope is fine because no job in this workflow
+# runs untrusted code with that scope (PR trigger does not run image jobs).
+permissions:
+  contents: read
+  packages: write
+  id-token: none
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  # The .NET and Angular stacks are independent, so we run them in parallel
+  # on the self-hosted runner. cx23 has 4 GB RAM; combined peak
+  # (~1.5 GB dotnet + ~500 MB yarn/vitest) fits with headroom. If
+  # `oom-killer` shows up in dmesg or a job logs `Killed`, add
+  # `concurrency: { group: build-test-runner-${{ github.ref }},
+  # cancel-in-progress: false }` to BOTH jobs to serialize them.
+  build-test-dotnet:
+    name: Build & Test (.NET)
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET (pinned via global.json)
+        uses: actions/setup-dotnet@v5
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props', 'global.json', 'NuGet.Config') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore .NET dependencies
+        run: dotnet restore ${PROJECT_NAME}.slnx
+
+      - name: Build (Release)
+        run: dotnet build ${PROJECT_NAME}.slnx --no-restore --configuration Release
+
+      - name: Test (Release)
+        run: dotnet test ${PROJECT_NAME}.slnx --no-build --configuration Release --logger "trx;LogFilePrefix=test-results" --results-directory TestResults
+
+      - name: Upload .NET test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dotnet-test-results
+          path: TestResults/
+
+  build-test-angular:
+    name: Build & Test (Angular)
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Activate Yarn 1.22.22 via Corepack
+        run: |
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+
+      - name: Cache Yarn dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            angular/.yarn-cache
+            angular/node_modules
+          key: yarn-${{ runner.os }}-${{ hashFiles('angular/yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
+
+      - name: Install Angular dependencies (frozen lockfile)
+        run: yarn --cwd angular install --frozen-lockfile --cache-folder .yarn-cache
+
+      - name: Lint Angular
+        run: yarn --cwd angular lint
+
+      - name: Test Angular (Vitest)
+        run: yarn --cwd angular test --watch=false
+
+  dependency-audit:
+    name: Dependency Audit (Critical-only, non-blocking)
+    runs-on: self-hosted
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET (pinned via global.json)
+        uses: actions/setup-dotnet@v5
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Activate Yarn 1.22.22 via Corepack
+        run: |
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props', 'global.json', 'NuGet.Config') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore .NET dependencies
+        run: dotnet restore ${PROJECT_NAME}.slnx
+
+      - name: NuGet vulnerability scan (Critical-only)
+        shell: bash
+        run: |
+          dotnet list ${PROJECT_NAME}.slnx package --vulnerable --include-transitive --format json > nuget-audit.json
+          python3 - <<'PY'
+          import json, sys
+          with open('nuget-audit.json') as f:
+              data = json.load(f)
+          has_critical = False
+          has_high = False
+          for proj in data.get('projects', []):
+              for fw in proj.get('frameworks', []) or []:
+                  for pkg in (fw.get('topLevelPackages') or []) + (fw.get('transitivePackages') or []):
+                      for v in pkg.get('vulnerabilities', []) or []:
+                          sev = (v.get('severity') or '').lower()
+                          if sev == 'critical':
+                              has_critical = True
+                              print(f"::error::Critical NuGet CVE in {pkg.get('id')}: {v.get('advisoryUrl')}")
+                          elif sev == 'high':
+                              has_high = True
+                              print(f"::warning::High NuGet CVE in {pkg.get('id')}: {v.get('advisoryUrl')}")
+          if has_critical:
+              sys.exit(1)
+          print('NuGet audit: no Critical CVEs found.')
+          PY
+
+      - name: npm (yarn) audit — Critical-only
+        shell: bash
+        run: |
+          cd angular
+          # Yarn 1 `yarn audit` exits with a bitmask: 1=INFO, 2=LOW, 4=MODERATE,
+          # 8=HIGH, 16=CRITICAL. Fail only on Critical (bit 16).
+          yarn audit --level critical --groups dependencies || ec=$?
+          ec=${ec:-0}
+          echo "yarn audit exit code: $ec"
+          if [ $(( ec & 16 )) -ne 0 ]; then
+            echo "::error::Critical npm CVE detected via yarn audit."
+            exit 1
+          fi
+          if [ $(( ec & 8 )) -ne 0 ]; then
+            echo "::warning::High-severity npm CVE detected via yarn audit (non-blocking)."
+          fi
+          echo "yarn audit: no Critical CVEs found."
+
+  detect-changes:
+    name: Detect changed paths
+    # Gate on Build & Test so we don't even compute the diff (let alone publish)
+    # for a commit whose tests failed.
+    needs: [build-test-dotnet, build-test-angular]
+    # Image builds only fire for push + workflow_dispatch; skip the diff
+    # entirely on pull_request runs (Build & Test is enough there).
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: self-hosted
+    outputs:
+      dotnet: ${{ steps.filter.outputs.dotnet }}
+      web: ${{ steps.filter.outputs.web }}
+      workflow: ${{ steps.filter.outputs.workflow }}
+      ref-is-tag: ${{ startsWith(github.ref, 'refs/tags/') }}
+      ref-is-api-tag: ${{ startsWith(github.ref, 'refs/tags/api-v') }}
+      ref-is-web-tag: ${{ startsWith(github.ref, 'refs/tags/web-v') }}
+      ref-is-migrator-tag: ${{ startsWith(github.ref, 'refs/tags/migrator-v') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # paths-filter needs full history to compute the diff base on push
+          fetch-depth: 0
+
+      - name: Filter paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          # On a tag push the base ref is the previous tag, which gives a noisy
+          # diff. The downstream `if:` for each image job ORs the path filter
+          # output with explicit tag predicates so the right image always builds
+          # on a tag push regardless of the diff outcome.
+          filters: |
+            dotnet:
+              - 'src/${PROJECT_NAME}.*/**'
+              - 'test/**'
+              - '${PROJECT_NAME}.slnx'
+              - 'common.props'
+              - 'global.json'
+              - 'NuGet.Config'
+              - '.dockerignore'
+              - 'src/Dockerfile.dotnet'
+            web:
+              - 'angular/**'
+              - 'angular/Dockerfile'
+              - 'angular/Dockerfile.local'
+              - 'angular/.dockerignore'
+            workflow:
+              - '.github/workflows/cicd.yml'
+
+  build-and-push-api:
+    name: Build & Push API
+    needs: [build-test-dotnet, build-test-angular, detect-changes]
+    # Path-filter outputs can evaluate true on tag pushes from noisy `before`
+    # diffs (new tags push `before=0000…`), so non-target jobs may run. Scope
+    # path-based predicates to `refs/heads/main`; keep tag predicates as-is so
+    # releases still trigger the right jobs.
+    if: |
+      ( github.event_name == 'push' && (
+        (
+          github.ref == 'refs/heads/main' && (
+            needs.detect-changes.outputs.dotnet == 'true' ||
+            needs.detect-changes.outputs.workflow == 'true'
+          )
+        ) ||
+        needs.detect-changes.outputs.ref-is-api-tag == 'true'
+      ) ) ||
+      ( github.event_name == 'workflow_dispatch' && inputs.force_rebuild )
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${PROJECT_NAME_LOWER}-api
+          tags: |
+            # Immutable per-commit short-SHA tag (e.g., `:sha-a1b2c3d`) on main pushes.
+            type=sha,enable=${{ github.ref == 'refs/heads/main' }},prefix=sha-,format=short
+            # Floating `:main` tag on every main push — what dev/staging pulls.
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            # Semver tag from `api-v<X.Y.Z>` git tags — capture group keeps the `v`
+            # prefix so the image tag is `:v1.2.3` (visually distinct from sha-prefix).
+            type=match,pattern=api-(v.*),group=1,enable=${{ needs.detect-changes.outputs.ref-is-api-tag == 'true' }}
+            # Floating `:latest` only when a tag is being published — never on main.
+            type=raw,value=latest,enable=${{ needs.detect-changes.outputs.ref-is-api-tag == 'true' }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./src/Dockerfile.dotnet
+          target: api
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Per-service buildcache tag on the service's own image repo —
+          # cache poisoning cannot cross-contaminate other images.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${PROJECT_NAME_LOWER}-api:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${PROJECT_NAME_LOWER}-api:buildcache,mode=max
+          # SBOM + provenance attestations deferred to future security pass (Cosign).
+          provenance: false
+          sbom: false
+
+      - name: Echo published tags
+        env:
+          PUBLISHED_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "Pushed: ${PUBLISHED_TAGS}"
+
+  build-and-push-migrator:
+    name: Build & Push DbMigrator
+    needs: [build-test-dotnet, build-test-angular, detect-changes]
+    # Migrator follows the API timeline (schema + code must travel together),
+    # so an api-v* tag also rebuilds the migrator at the same version. The
+    # migrator-v* tag is a safety hatch for the rare "migration-only" release.
+    # Same branch gate as the API job; path-based predicates only fire on main
+    # pushes, tag predicates always pass through.
+    if: |
+      ( github.event_name == 'push' && (
+        (
+          github.ref == 'refs/heads/main' && (
+            needs.detect-changes.outputs.dotnet == 'true' ||
+            needs.detect-changes.outputs.workflow == 'true'
+          )
+        ) ||
+        needs.detect-changes.outputs.ref-is-api-tag == 'true' ||
+        needs.detect-changes.outputs.ref-is-migrator-tag == 'true'
+      ) ) ||
+      ( github.event_name == 'workflow_dispatch' && inputs.force_rebuild )
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${PROJECT_NAME_LOWER}-dbmigrator
+          tags: |
+            type=sha,enable=${{ github.ref == 'refs/heads/main' }},prefix=sha-,format=short
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            # Accept BOTH api-v* AND migrator-v* — migrator tracks api.
+            type=match,pattern=api-(v.*),group=1,enable=${{ needs.detect-changes.outputs.ref-is-api-tag == 'true' }}
+            type=match,pattern=migrator-(v.*),group=1,enable=${{ needs.detect-changes.outputs.ref-is-migrator-tag == 'true' }}
+            type=raw,value=latest,enable=${{ needs.detect-changes.outputs.ref-is-api-tag == 'true' || needs.detect-changes.outputs.ref-is-migrator-tag == 'true' }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./src/Dockerfile.dotnet
+          target: migrator
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${PROJECT_NAME_LOWER}-dbmigrator:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${PROJECT_NAME_LOWER}-dbmigrator:buildcache,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Echo published tags
+        env:
+          PUBLISHED_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "Pushed: ${PUBLISHED_TAGS}"
+
+  build-and-push-web:
+    name: Build & Push Web
+    needs: [build-test-dotnet, build-test-angular, detect-changes]
+    # Same branch gate as the API/migrator jobs; path-based predicates only
+    # fire on main pushes, tag predicate always passes.
+    if: |
+      ( github.event_name == 'push' && (
+        (
+          github.ref == 'refs/heads/main' && (
+            needs.detect-changes.outputs.web == 'true' ||
+            needs.detect-changes.outputs.workflow == 'true'
+          )
+        ) ||
+        needs.detect-changes.outputs.ref-is-web-tag == 'true'
+      ) ) ||
+      ( github.event_name == 'workflow_dispatch' && inputs.force_rebuild )
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${PROJECT_NAME_LOWER}-web
+          tags: |
+            type=sha,enable=${{ github.ref == 'refs/heads/main' }},prefix=sha-,format=short
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=match,pattern=web-(v.*),group=1,enable=${{ needs.detect-changes.outputs.ref-is-web-tag == 'true' }}
+            type=raw,value=latest,enable=${{ needs.detect-changes.outputs.ref-is-web-tag == 'true' }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          # The Angular Dockerfile copies from `angular/` so the build context
+          # is the angular subdirectory.
+          context: ./angular
+          file: ./angular/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${PROJECT_NAME_LOWER}-web:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${PROJECT_NAME_LOWER}-web:buildcache,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Echo published tags
+        env:
+          PUBLISHED_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "Pushed: ${PUBLISHED_TAGS}"
+
+  summary:
+    name: Summary
+    needs: [build-and-push-api, build-and-push-migrator, build-and-push-web]
+    if: always()
+    runs-on: self-hosted
+    steps:
+      - name: Write run summary
+        # Defensive: pass interpolated values via env so we never expand a
+        # context value directly inside the shell — even though github.ref
+        # is server-validated, this is the safest pattern for any future
+        # context additions (PR titles, commit messages, etc.).
+        env:
+          REF: ${{ github.ref }}
+          API_RESULT: ${{ needs.build-and-push-api.result }}
+          MIGRATOR_RESULT: ${{ needs.build-and-push-migrator.result }}
+          WEB_RESULT: ${{ needs.build-and-push-web.result }}
+        run: |
+          {
+            echo "## Docker Publish Summary"
+            echo ""
+            echo "Ref: \`${REF}\`"
+            echo ""
+            echo "| Image | Result |"
+            echo "|---|---|"
+            echo "| ${PROJECT_NAME_LOWER}-api | ${API_RESULT} |"
+            echo "| ${PROJECT_NAME_LOWER}-dbmigrator | ${MIGRATOR_RESULT} |"
+            echo "| ${PROJECT_NAME_LOWER}-web | ${WEB_RESULT} |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,306 @@
+# .github/workflows/_terraform-plan.yml — reusable plan-on-PR template.
+#
+# `workflow_call`-only. Per-env wrappers (e.g., staging-terraform-plan.yml)
+# own the `pull_request` trigger + paths filter and call this template
+# with env-specific inputs. The `_` prefix is a community convention
+# signalling "private / not directly triggerable".
+#
+# Substantively a parameterisation of today's `.github/workflows/
+# terraform-plan.yml` — every step, every secret mask, every comment
+# pattern is preserved; only the env-coupled strings (env name, working
+# directory, HCP workspace, concurrency-group discriminator, comment
+# marker, artifact name) are lifted to inputs.
+#
+# Adversarial-pass posture carries forward from the single-env workflow:
+# - Every secret value passes through `env:` → bash, never `${{ }}` into
+#   a `run:` shell line directly. Script-injection hardening.
+# - `::add-mask::` re-applied early as belt-and-suspenders for
+#   HCLOUD_TOKEN + HCP_TF_TOKEN.
+# - Comment body is constructed via env-var indirection (BODY shell var
+#   from on-disk file) and passed to `gh api -f body="$BODY"`.
+# - Permissions are the minimum needed to post a PR comment:
+#   `contents: read` + `pull-requests: write`.
+# - Concurrency `cancel-in-progress: true` — a new push to the same PR
+#   supersedes the in-flight plan.
+# - Comment idempotency uses an HTML marker env-suffixed via
+#   `inputs.env_name` so a multi-env PR gets distinct comments per env.
+
+name: _terraform-plan
+
+# ─────────────────────────────────────────────────────────────────────
+# RUNNER NOTE — this workflow ships defaulting to `runs-on: self-hosted`.
+#
+# To run on GitHub-hosted infrastructure instead:
+#   1. Replace every `runs-on: self-hosted` line in this file with
+#      `runs-on: ubuntu-latest`.
+#   2. (If applicable) delete .github/workflows/runner-cache-cleanup.yml
+#      entirely — it only manages a self-hosted runner's local cache.
+#   3. See docs/scaffold-runbook.md → "Switching from self-hosted to
+#      GitHub-hosted runners" for the full migration steps.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      env_name:
+        description: 'Environment name (e.g., staging, staging2). Used for environment binding, log prefixes, and comment-marker disambiguation.'
+        type: string
+        required: true
+      tf_working_dir:
+        description: 'Terraform working directory (e.g., terraform/staging).'
+        type: string
+        required: true
+      hcp_workspace:
+        description: 'HCP Terraform workspace name (e.g., ${PROJECT_NAME_LOWER}-staging) — logged for operator clarity; actual workspace selection comes from the cloud {} block in the env root.'
+        type: string
+        required: true
+      concurrency_group:
+        description: 'Optional concurrency group override; this template builds its own per-env per-PR group, so the input is accepted for contract parity and ignored.'
+        type: string
+        required: false
+        default: ''
+      ssh_allowed_cidrs:
+        description: 'JSON-encoded list of CIDRs for the VM firewall SSH allow-list. Forwarded as TF_VAR_ssh_allowed_cidrs.'
+        type: string
+        required: true
+      operator_ssh_pubkeys:
+        description: 'JSON-encoded map (name → ssh-key) of operator pubkeys. Forwarded as TF_VAR_operator_ssh_pubkeys.'
+        type: string
+        required: true
+      pr_number:
+        description: 'PR number for concurrency-group discriminator + comment scope. Empty when invoked outside a PR (workflow_dispatch). Falls back to github.run_id for concurrency in that case.'
+        type: string
+        required: false
+        default: ''
+
+# Per-env per-PR group so newer pushes cancel superseded plans, but a PR
+# touching multiple envs runs all env plans concurrently. The fallback
+# to github.run_id keeps the group unique on a non-PR (workflow_dispatch)
+# call where pr_number is empty.
+concurrency:
+  group: terraform-plan-${{ inputs.env_name }}-${{ inputs.pr_number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: self-hosted
+    environment: ${{ inputs.env_name }}
+    timeout-minutes: 15
+    env:
+      TF_VAR_hcloud_token:         ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+      TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          # Plan reflects the PR's HEAD when a PR triggered the wrapper;
+          # for workflow_dispatch invocations github.event.pull_request is
+          # null and checkout falls back to the dispatched ref.
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Pre-flight — verify gh CLI on runner
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::gh CLI not installed on self-hosted runner."
+            echo "::error::Install per docs/staging-runbook.md §2.5 (runner deps)."
+            exit 1
+          fi
+
+      - name: Defense-in-depth secret masking
+        env:
+          HCP_TF_TOKEN: ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          # No `set -x` here — never trace this step's shell.
+          set -euo pipefail
+          if [[ -n "$HCP_TF_TOKEN" ]]; then
+            echo "::add-mask::$HCP_TF_TOKEN"
+          fi
+          if [[ -n "$HCLOUD_TOKEN" ]]; then
+            echo "::add-mask::$HCLOUD_TOKEN"
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          # Matches required_version = "~> 1.10" in env root's versions.tf.
+          terraform_version: 1.10.5
+          # Wrapper rewrites stdout/exit codes — we need raw exit + raw
+          # stdout for `terraform show` capture and per-step `outcome` gate.
+          terraform_wrapper: false
+
+      - name: terraform init
+        id: tf-init
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          # HCP's official env-var name for authenticating to app.terraform.io.
+          TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:              ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false -no-color
+
+      - name: terraform validate
+        id: tf-validate
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:              ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -euo pipefail
+          terraform validate -no-color
+
+      - name: terraform plan
+        id: tf-plan
+        working-directory: ${{ inputs.tf_working_dir }}
+        continue-on-error: true
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:              ${{ secrets.HCLOUD_TOKEN }}
+          # JSON-encoded list/map inputs reach Terraform via TF_VAR_* —
+          # Terraform parses the JSON automatically for list(string) /
+          # map(string) typed variables. Set at the step level so the
+          # parameterisation is grep-visible right next to the plan call.
+          TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+          TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -no-color -out=tfplan.bin
+          terraform show -no-color tfplan.bin > tfplan.txt
+
+      - name: Upload tfplan artifact
+        # Always upload if the binary exists — apply-side consumers can
+        # read even a partially produced plan for debugging. The artifact
+        # also gives reviewers a way to download the full plan when
+        # truncation kicks in (>60k chars).
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-${{ inputs.env_name }}-${{ github.event.pull_request.number || github.run_id }}
+          path: ${{ inputs.tf_working_dir }}/tfplan.bin
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Truncate plan output for comment body
+        # GitHub PR comments cap at 65,536 chars. Allow ~60k chars of
+        # plan text + ~5k chars of wrapper markdown. On overflow, keep
+        # the first 25k + a marker + the last 25k. Full plan is in the
+        # artifact above.
+        env:
+          PLAN_OUTCOME:   ${{ steps.tf-plan.outcome }}
+          TF_WORKING_DIR: ${{ inputs.tf_working_dir }}
+        run: |
+          set -euo pipefail
+          plan_file="${TF_WORKING_DIR}/tfplan.txt"
+          out_file="${RUNNER_TEMP:-/tmp}/tfplan.truncated.txt"
+          if [[ ! -f "$plan_file" ]]; then
+            # plan step crashed before `terraform show` ran. Synthesize a
+            # minimal placeholder so the comment still posts with the
+            # FAILED header.
+            printf '(no plan output captured — plan outcome: %s)\n' "$PLAN_OUTCOME" > "$out_file"
+          else
+            size=$(wc -c < "$plan_file")
+            if [[ "$size" -gt 60000 ]]; then
+              {
+                head -c 25000 "$plan_file"
+                printf '\n\n[... output truncated, see tfplan artifact ...]\n\n'
+                tail -c 25000 "$plan_file"
+              } > "$out_file"
+            else
+              cp "$plan_file" "$out_file"
+            fi
+          fi
+          echo "TRUNCATED_PLAN_PATH=$out_file" >> "$GITHUB_ENV"
+
+      - name: Build comment body
+        env:
+          PLAN_OUTCOME:  ${{ steps.tf-plan.outcome }}
+          PR_HEAD_SHA:   ${{ github.event.pull_request.head.sha }}
+          RUN_URL:       ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ENV_NAME:      ${{ inputs.env_name }}
+          HCP_WORKSPACE: ${{ inputs.hcp_workspace }}
+        run: |
+          set -euo pipefail
+          body_file="${RUNNER_TEMP:-/tmp}/comment-body.md"
+          if [[ "$PLAN_OUTCOME" == "success" ]]; then
+            status_header="### terraform plan (${ENV_NAME}) succeeded"
+          else
+            status_header="### terraform plan (${ENV_NAME}) FAILED — outcome: ${PLAN_OUTCOME}"
+          fi
+          # shellcheck disable=SC2016
+          # The single-quoted `%s` format strings below are printf format
+          # specifiers, not shell expressions — keep single-quoted so `$`
+          # and backticks aren't expanded by the shell.
+          {
+            printf '<!-- terraform-plan-comment-marker-%s -->\n' "$ENV_NAME"
+            printf '%s\n\n' "$status_header"
+            printf '**Environment:** `%s`\n\n' "$ENV_NAME"
+            printf '**HCP workspace:** `%s`\n\n' "$HCP_WORKSPACE"
+            printf '**Commit:** `%s`\n\n' "$PR_HEAD_SHA"
+            printf '**Workflow run:** [View run](%s)\n\n' "$RUN_URL"
+            printf '<details><summary>Plan output</summary>\n\n'
+            printf '```hcl\n'
+            cat "$TRUNCATED_PLAN_PATH"
+            printf '\n```\n\n'
+            printf '</details>\n'
+          } > "$body_file"
+          echo "COMMENT_BODY_PATH=$body_file" >> "$GITHUB_ENV"
+
+      - name: Post or edit PR comment
+        # Only attempt comment posting when invoked from a PR context.
+        # workflow_dispatch invocations of the wrapper have an empty
+        # pr_number — skip silently rather than failing.
+        if: inputs.pr_number != ''
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          ENV_NAME:  ${{ inputs.env_name }}
+          BODY_FILE: ${{ env.COMMENT_BODY_PATH }}
+        run: |
+          set -euo pipefail
+          BODY=$(cat "$BODY_FILE")
+          MARKER="<!-- terraform-plan-comment-marker-${ENV_NAME} -->"
+          # Paginate every comment on the PR, filter for our env-suffixed
+          # marker on the FIRST line of the body, take the OLDEST match
+          # so collision with a human-pasted marker still preserves the
+          # bot's original comment deterministically.
+          COMMENT_ID=$(gh api \
+            "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" \
+            | head -1)
+          if [[ -n "$COMMENT_ID" ]]; then
+            echo "Editing existing comment id=$COMMENT_ID"
+            gh api -X PATCH \
+              "repos/${REPO}/issues/comments/${COMMENT_ID}" \
+              -f body="$BODY" >/dev/null
+          else
+            echo "Posting new comment on PR #${PR_NUMBER}"
+            gh api \
+              "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -f body="$BODY" >/dev/null
+          fi
+
+      - name: Fail job if plan failed
+        # Comment was already posted above so the PR author sees the
+        # error inline. Now we surface the failure to the Actions UI /
+        # required-check gate.
+        if: steps.tf-plan.outcome == 'failure'
+        env:
+          ENV_NAME:  ${{ inputs.env_name }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$PR_NUMBER" ]]; then
+            echo "::error::terraform plan (${ENV_NAME}) failed — see PR comment + artifact tfplan-${ENV_NAME}-${PR_NUMBER}."
+          else
+            echo "::error::terraform plan (${ENV_NAME}) failed — see workflow run artifact."
+          fi
+          exit 1

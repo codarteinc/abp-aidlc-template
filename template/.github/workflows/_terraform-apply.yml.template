@@ -1,0 +1,532 @@
+# .github/workflows/_terraform-apply.yml — reusable manual apply template.
+#
+# `workflow_call`-only. Per-env wrappers own the `workflow_dispatch`
+# trigger surface (with the user-facing `confirm` / `commit_sha` /
+# `scope` inputs) and forward those into this template along with the
+# env-coupled values (env name, working directory, HCP workspace,
+# concurrency group, deploy SSH key).
+#
+# Substantively a parameterisation of today's `.github/workflows/
+# terraform-apply.yml` — every step, every secret mask, the
+# confirm-string gate, the cloud-init SSH wait, the Discord embeds are
+# preserved; only env-coupled strings (env name, working dir, HCP
+# workspace, concurrency group, deploy SSH key secret) are lifted to
+# inputs.
+#
+# Adversarial-pass posture carries forward from the single-env workflow:
+# - Trigger surface (workflow_dispatch only) lives in the wrapper, not
+#   here. This template is only reachable via `workflow_call`.
+# - Confirm-string gate (`confirm == "yes I have read the plan"`)
+#   runs BEFORE any HCP / Hetzner contact.
+# - `terraform apply -auto-approve` is required because the self-hosted
+#   runner has no TTY.
+# - Required-reviewer gate is configured at the GitHub Environment
+#   level (Settings → Environments → <env> → Required reviewers).
+# - Every `secrets.*` and `inputs.*` value reaches bash via `env:`
+#   indirection.
+# - `::add-mask::` re-applied early on the tokens AND the deploy SSH
+#   key as belt-and-suspenders.
+# - `commit_sha` empty resolves to HEAD of `origin/main` via `gh api`,
+#   NEVER `github.sha`.
+
+name: _terraform-apply
+
+# ─────────────────────────────────────────────────────────────────────
+# RUNNER NOTE — this workflow ships defaulting to `runs-on: self-hosted`.
+#
+# To run on GitHub-hosted infrastructure instead:
+#   1. Replace every `runs-on: self-hosted` line in this file with
+#      `runs-on: ubuntu-latest`.
+#   2. (If applicable) delete .github/workflows/runner-cache-cleanup.yml
+#      entirely — it only manages a self-hosted runner's local cache.
+#   3. See docs/scaffold-runbook.md → "Switching from self-hosted to
+#      GitHub-hosted runners" for the full migration steps.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      env_name:
+        description: 'Environment name (e.g., staging, staging2).'
+        type: string
+        required: true
+      tf_working_dir:
+        description: 'Terraform working directory (e.g., terraform/staging).'
+        type: string
+        required: true
+      hcp_workspace:
+        description: 'HCP Terraform workspace name (e.g., ${PROJECT_NAME_LOWER}-staging) — logged for operator clarity.'
+        type: string
+        required: true
+      concurrency_group:
+        description: 'Concurrency group (e.g., ${PROJECT_NAME_LOWER}-staging-deploy). Shared with the per-env app-deploy + rollback workflows so apply, deploy, and rollback queue serially.'
+        type: string
+        required: true
+      ssh_allowed_cidrs:
+        description: 'JSON-encoded list of CIDRs for the VM firewall SSH allow-list. Forwarded as TF_VAR_ssh_allowed_cidrs.'
+        type: string
+        required: true
+      operator_ssh_pubkeys:
+        description: 'JSON-encoded map (name → ssh-key) of operator pubkeys. Forwarded as TF_VAR_operator_ssh_pubkeys.'
+        type: string
+        required: true
+      confirm:
+        description: 'Operator-typed confirmation string — must equal exactly: yes I have read the plan'
+        type: string
+        required: true
+      commit_sha:
+        description: 'Full commit SHA to apply (empty = latest commit on origin/main).'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      deploy_ssh_key:
+        description: 'Per-env deploy SSH private key (the wrapper forwards from its env-specific secret, e.g. STAGING_DEPLOY_SSH_KEY). Masked via ::add-mask:: at template entry.'
+        required: true
+      HCLOUD_TOKEN:
+        description: 'Hetzner Cloud API token (org-level secret, forwarded by the wrapper).'
+        required: true
+      HCP_TF_TOKEN:
+        description: 'HCP Terraform API token (org-level secret, forwarded by the wrapper).'
+        required: true
+      DISCORD_WEBHOOK_URL:
+        description: 'Discord webhook for apply notifications (org-level secret, forwarded by the wrapper). Optional — every consumer step skips when this is empty.'
+        required: false
+
+# Per-env concurrency. `cancel-in-progress: false` so a second trigger
+# queues; never partial-apply, never race with a deploy/rollback.
+concurrency:
+  group: ${{ inputs.concurrency_group }}
+  cancel-in-progress: false
+
+# Least privilege. Apply only needs to check out the repo and call HCP /
+# Hetzner APIs (both via env-var-supplied tokens, not GITHUB_TOKEN).
+# `gh api commits/main` uses GITHUB_TOKEN with `contents: read`.
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: self-hosted
+    environment: ${{ inputs.env_name }}
+    timeout-minutes: 30
+    env:
+      TF_VAR_hcloud_token:         ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+      TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+    steps:
+      - name: Pre-flight — gh CLI must be installed
+        # Resolve target ref + Discord notifications shell out to `gh`.
+        # Fail loudly here rather than mid-step with a cryptic "command
+        # not found".
+        run: |
+          if ! command -v gh > /dev/null 2>&1; then
+            echo "::error::gh CLI not installed on runner — install per docs/staging-runbook.md §2.5"
+            exit 1
+          fi
+
+      - name: Validate confirm input
+        # Runs BEFORE any HCP / Hetzner contact so a typo is fully
+        # recoverable (zero state contact, zero cloud spend).
+        env:
+          CONFIRM:  ${{ inputs.confirm }}
+          ENV_NAME: ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRM" != "yes I have read the plan" ]]; then
+            echo "::error::confirm input must be exactly: yes I have read the plan"
+            echo "::error::See docs/staging-runbook.md §13 for the apply procedure (env: ${ENV_NAME})."
+            exit 1
+          fi
+          echo "::notice::Confirm string accepted for env=${ENV_NAME}."
+
+      - name: Resolve target ref
+        id: resolve
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          REPO:       ${{ github.repository }}
+          ENV_NAME:   ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$COMMIT_SHA" ]]; then
+            TARGET_SHA="$COMMIT_SHA"
+            SOURCE="operator-supplied commit_sha"
+          else
+            # Resolve HEAD of origin/main EXPLICITLY via the GitHub API.
+            # NEVER fall back to `github.sha` — for workflow_dispatch,
+            # that is the SHA of the ref selected at dispatch time.
+            TARGET_SHA=$(gh api "repos/${REPO}/commits/main" --jq .sha)
+            SOURCE="HEAD of origin/main"
+          fi
+          if [[ -z "$TARGET_SHA" ]]; then
+            echo "::error::Failed to resolve target SHA."
+            exit 1
+          fi
+          echo "::notice::Resolved target_sha=${TARGET_SHA} (source: ${SOURCE})"
+          echo "target_sha=${TARGET_SHA}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Terraform Apply (${ENV_NAME}) — resolving target"
+            echo ""
+            echo "- **Target SHA:** \`${TARGET_SHA}\`"
+            echo "- **Source:** ${SOURCE}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout source at resolved SHA
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.resolve.outputs.target_sha }}
+
+      - name: Defense-in-depth secret masking
+        env:
+          HCLOUD_TOKEN:        ${{ secrets.HCLOUD_TOKEN }}
+          HCP_TF_TOKEN:        ${{ secrets.HCP_TF_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DEPLOY_SSH_KEY:      ${{ secrets.deploy_ssh_key }}
+        run: |
+          # No `set -x` here — never trace this step's shell.
+          set -euo pipefail
+          echo "::add-mask::$HCLOUD_TOKEN"
+          echo "::add-mask::$HCP_TF_TOKEN"
+          # Discord webhook URL embeds a token — mask if present. Empty =
+          # silent no-op (notifications are an optional secret).
+          if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "::add-mask::$DISCORD_WEBHOOK_URL"
+          fi
+          # Deploy SSH key arrives as a workflow_call input (a string),
+          # so GitHub's auto-masking of secrets.* references does not
+          # apply at this layer. Mask explicitly so any subsequent step
+          # output (terraform output dump, ssh-keyscan stderr, etc.) is
+          # redacted.
+          if [[ -n "$DEPLOY_SSH_KEY" ]]; then
+            echo "::add-mask::$DEPLOY_SSH_KEY"
+          fi
+
+      - name: Setup terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.10.5'
+          terraform_wrapper: false
+
+      - name: Discord notify start
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ steps.resolve.outputs.target_sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          ENV_NAME:            ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          # Optional secret — absence is the toggle. Silent no-op when unset.
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          payload=$(jq -n \
+            --arg title "Terraform Apply Started" \
+            --arg env "$ENV_NAME" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 3447003,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          # `|| true` — a Discord outage must NEVER fail the apply step.
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: terraform init
+        id: tf-init
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:              ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false
+
+      - name: terraform validate
+        id: tf-validate
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:              ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -euo pipefail
+          terraform validate
+
+      - name: terraform plan
+        id: tf-plan
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io:   ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:                ${{ secrets.HCLOUD_TOKEN }}
+          # JSON-encoded list/map inputs reach Terraform via TF_VAR_*.
+          TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+          TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -out=tfplan
+          # Human-readable rendering of the binary plan.
+          terraform show -no-color tfplan > tfplan.txt
+
+      - name: terraform apply
+        id: tf-apply
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io:   ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:                ${{ secrets.HCLOUD_TOKEN }}
+          TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+          TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+        run: |
+          set -euo pipefail
+          # `-auto-approve` is required: the self-hosted runner has no
+          # TTY for an interactive `yes` prompt. The confirm-string gate
+          # is the operator-consent equivalent.
+          terraform apply -input=false -auto-approve tfplan
+
+      - name: Capture terraform outputs
+        id: outputs
+        if: success()
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:              ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Dump all outputs as JSON. If a future contributor adds a
+          # sensitive output, this dump MUST be filtered or skipped.
+          terraform output -json > tf-outputs.json
+          # Resolve server IPv4 for the cloud-init wait step. The shared
+          # module exposes the VM IPv4 via the `vm_ipv4` output
+          # (matching the unit-02 + unit-04 contract). Always non-empty
+          # on a successful apply because the primary IP is part of every
+          # plan output.
+          VM_IPV4=$(terraform output -raw vm_ipv4)
+          echo "vm_ipv4=$VM_IPV4" >> "$GITHUB_OUTPUT"
+
+      # Wait for the VM to be deploy-ready BEFORE reporting green to
+      # Discord. Mirrors the single-env behavior: SSH up, cloud-init
+      # converged, then bootstrap-complete marker present. On timeout
+      # this step FAILS the apply (hard correctness over async-cloud-init
+      # optimism). 10 minutes total budget per the unit spec.
+      - name: Wait for SSH + cloud-init bootstrap to complete
+        if: success()
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.deploy_ssh_key }}
+          VM_IP:          ${{ steps.outputs.outputs.vm_ipv4 }}
+          ENV_NAME:       ${{ inputs.env_name }}
+          # 10-minute total budget per unit spec, polled every 15s.
+          TOTAL_TIMEOUT_SECONDS: '600'
+          POLL_INTERVAL_SECONDS: '15'
+        run: |
+          set -euo pipefail
+          install -d -m 0700 ~/.ssh
+          KEYFILE=$(mktemp ~/.ssh/deploy-key.XXXXXX)
+          chmod 0600 "$KEYFILE"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$KEYFILE"
+          # Trap on exit so the key file never lingers on the self-hosted
+          # runner — defense in depth alongside ::add-mask::.
+          trap 'rm -f "$KEYFILE"' EXIT
+          # TOFU known_hosts — trust whatever host key the newly-provisioned
+          # VM presents. The destroy template's known-hosts cleanup runs
+          # against the OLD IP only.
+          ssh-keyscan -H "$VM_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "Waiting for cloud-init bootstrap marker on $VM_IP (env=$ENV_NAME, timeout ${TOTAL_TIMEOUT_SECONDS}s, poll ${POLL_INTERVAL_SECONDS}s)..."
+          MARKER='/var/lib/${PROJECT_NAME_LOWER}/.bootstrap-complete'
+          START=$(date +%s)
+          while :; do
+            if ssh -4 -i "$KEYFILE" \
+                  -o StrictHostKeyChecking=accept-new \
+                  -o ConnectTimeout=5 \
+                  -o BatchMode=yes \
+                  "deploy@$VM_IP" "test -f $MARKER" >/dev/null 2>&1; then
+              echo "::notice::VM $VM_IP (env=$ENV_NAME) is deploy-ready (bootstrap marker present)."
+              break
+            fi
+            ELAPSED=$(($(date +%s) - START))
+            if [[ "$ELAPSED" -gt "$TOTAL_TIMEOUT_SECONDS" ]]; then
+              echo "::error::Cloud-init bootstrap did not complete within 10 minutes — see runbook docs/staging-runbook.md"
+              echo "::error::VM IPv4: $VM_IP (env=$ENV_NAME). Inspect /var/log/cloud-init-output.log on the VM."
+              exit 1
+            fi
+            sleep "$POLL_INTERVAL_SECONDS"
+          done
+
+      - name: Write step summary
+        if: always()
+        env:
+          TARGET_SHA:     ${{ steps.resolve.outputs.target_sha }}
+          REPO:           ${{ github.repository }}
+          RUN_ID:         ${{ github.run_id }}
+          STATUS:         ${{ job.status }}
+          TF_WORKING_DIR: ${{ inputs.tf_working_dir }}
+          ENV_NAME:       ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          PLAN_PATH="${TF_WORKING_DIR}/tfplan.txt"
+          OUT_PATH="${TF_WORKING_DIR}/tf-outputs.json"
+          {
+            echo "## Terraform Apply (${ENV_NAME}) — ${STATUS}"
+            echo ""
+            echo "- **Commit:** \`${TARGET_SHA}\`"
+            echo "- **Run:** https://github.com/${REPO}/actions/runs/${RUN_ID}"
+            echo ""
+            echo "<details><summary>Plan diff</summary>"
+            echo ""
+            echo '```'
+            if [[ -s "$PLAN_PATH" ]]; then
+              cat "$PLAN_PATH"
+            else
+              echo "(no plan captured — terraform plan did not run or produced no output)"
+            fi
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "<details><summary>Outputs</summary>"
+            echo ""
+            echo '```json'
+            if [[ -s "$OUT_PATH" ]]; then
+              cat "$OUT_PATH"
+            else
+              echo "{}"
+            fi
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Discord notify success
+        if: success()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ steps.resolve.outputs.target_sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          TF_WORKING_DIR:      ${{ inputs.tf_working_dir }}
+          ENV_NAME:            ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          PLAN_PATH="${TF_WORKING_DIR}/tfplan.txt"
+          if [[ -s "$PLAN_PATH" ]]; then
+            RESOURCES=$(grep -E '^Plan: ' "$PLAN_PATH" | tail -n1 || true)
+            if [[ -z "$RESOURCES" ]]; then
+              if grep -qE '^No changes\.' "$PLAN_PATH"; then
+                RESOURCES="No changes (state already converged)"
+              else
+                RESOURCES="(plan summary not parseable)"
+              fi
+            fi
+          else
+            RESOURCES="(no plan captured)"
+          fi
+          payload=$(jq -n \
+            --arg title "Terraform Apply Succeeded — VM is deploy-ready" \
+            --arg env "$ENV_NAME" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            --arg resources "$RESOURCES" \
+            --arg next_step "Cloud-init has converged and the bootstrap-complete marker is present — proceed with the per-env app-deploy workflow." \
+            '{
+              embeds: [{
+                title: $title,
+                color: 3066993,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md},
+                  {name: "Resources",   value: $resources},
+                  {name: "Next step",   value: $next_step}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: Discord notify failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ steps.resolve.outputs.target_sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          FAILED_JOB:          ${{ github.job }}
+          ENV_NAME:            ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          if [[ -z "$COMMIT_SHA" ]]; then
+            SHA_SHORT="<unresolved>"
+            COMMIT_MD="\`<unresolved>\`"
+          else
+            SHA_SHORT="${COMMIT_SHA:0:7}"
+            COMMIT_MD="[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})"
+          fi
+          payload=$(jq -n \
+            --arg title "Terraform Apply FAILED" \
+            --arg env "$ENV_NAME" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg commit_md "$COMMIT_MD" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            --arg failed_job "$FAILED_JOB" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 15158332,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md},
+                  {name: "Failed job",  value: $failed_job, inline: true}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true

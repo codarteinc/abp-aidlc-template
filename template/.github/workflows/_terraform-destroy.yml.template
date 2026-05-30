@@ -1,0 +1,488 @@
+# .github/workflows/_terraform-destroy.yml — reusable manual destroy template.
+#
+# `workflow_call`-only. Per-env wrappers own the `workflow_dispatch`
+# trigger surface and forward the operator-typed inputs (confirm,
+# confirm_destroy, scope, optional targets) along with the env-coupled
+# values (env name, working directory, HCP workspace, concurrency
+# group) into this template.
+#
+# Substantively a parameterisation of today's `.github/workflows/
+# terraform-destroy.yml`. The DOUBLE-confirm gate is preserved — the
+# wrapper passes the operator-typed strings down, and the assertion
+# step in this template validates BOTH before any HCP / Hetzner
+# contact. The second confirmation is parameterised by `env_name` so
+# destroying staging requires `yes destroy the staging infrastructure`
+# and staging2 requires `yes destroy the staging2 infrastructure`.
+#
+# Adversarial-pass posture carries forward from the single-env workflow:
+# - Trigger surface (workflow_dispatch only) lives in the wrapper.
+# - DOUBLE-gate confirm validated BEFORE any HCP / Hetzner contact.
+# - `cancel-in-progress: false` so a second trigger queues; never
+#   partial-destroy.
+# - `scope=targeted` keeps the primary IP/firewall/DNS; `scope=full`
+#   tears those down too. Targeted is the default in the wrapper.
+# - Red Discord embed for "started" + orange for "succeeded" (destroy-
+#   success means the env is now non-functional; green would mislead).
+# - `commit_sha` empty resolves to HEAD of `origin/main` via `gh api`.
+
+name: _terraform-destroy
+
+# ─────────────────────────────────────────────────────────────────────
+# RUNNER NOTE — this workflow ships defaulting to `runs-on: self-hosted`.
+#
+# To run on GitHub-hosted infrastructure instead:
+#   1. Replace every `runs-on: self-hosted` line in this file with
+#      `runs-on: ubuntu-latest`.
+#   2. (If applicable) delete .github/workflows/runner-cache-cleanup.yml
+#      entirely — it only manages a self-hosted runner's local cache.
+#   3. See docs/scaffold-runbook.md → "Switching from self-hosted to
+#      GitHub-hosted runners" for the full migration steps.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      env_name:
+        description: 'Environment name (e.g., staging, staging2).'
+        type: string
+        required: true
+      tf_working_dir:
+        description: 'Terraform working directory (e.g., terraform/staging).'
+        type: string
+        required: true
+      hcp_workspace:
+        description: 'HCP Terraform workspace name (logged for operator clarity).'
+        type: string
+        required: true
+      concurrency_group:
+        description: 'Concurrency group (e.g., staging-deploy). Shared with the per-env app-deploy + rollback + apply workflows so destroy, apply, deploy, and rollback queue serially.'
+        type: string
+        required: true
+      ssh_allowed_cidrs:
+        description: 'JSON-encoded list of CIDRs for the VM firewall SSH allow-list. Forwarded as TF_VAR_ssh_allowed_cidrs.'
+        type: string
+        required: true
+      operator_ssh_pubkeys:
+        description: 'JSON-encoded map (name → ssh-key) of operator pubkeys. Forwarded as TF_VAR_operator_ssh_pubkeys.'
+        type: string
+        required: true
+      confirm:
+        description: 'First operator confirmation — must equal exactly: yes I have read the destroy plan'
+        type: string
+        required: true
+      confirm_destroy:
+        description: 'Second operator confirmation — must equal exactly: yes destroy the <env_name> infrastructure'
+        type: string
+        required: true
+      scope:
+        description: 'Destroy scope: targeted (server + dependents, keeps IP) or full (everything including IP).'
+        type: string
+        required: true
+      targets:
+        description: 'Optional comma-separated Terraform addresses for `scope=targeted`. Empty falls back to the canonical targeted set (server + rdns + firewall attachment) which the wrapper assembles.'
+        type: string
+        required: false
+        default: ''
+      commit_sha:
+        description: 'Full commit SHA to destroy against (empty = latest commit on origin/main).'
+        type: string
+        required: false
+        default: ''
+
+# Per-env concurrency. `cancel-in-progress: false` so a second trigger
+# queues; never partial-destroy.
+concurrency:
+  group: ${{ inputs.concurrency_group }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  destroy:
+    runs-on: self-hosted
+    environment: ${{ inputs.env_name }}
+    timeout-minutes: 15
+    env:
+      TF_VAR_hcloud_token:         ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+      TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+    steps:
+      - name: Pre-flight — gh CLI must be installed
+        run: |
+          if ! command -v gh > /dev/null 2>&1; then
+            echo "::error::gh CLI not installed on runner — install per docs/staging-runbook.md §2.5"
+            exit 1
+          fi
+
+      - name: Validate confirm + confirm_destroy inputs
+        # BOTH must match; runs BEFORE any HCP / Hetzner contact. The
+        # error message names WHICH input mismatched without echoing the
+        # user-supplied value — defense in depth against confirm-string
+        # leakage via log scraping. The two-input shape is intentional;
+        # collapsing to one input drops a defense-in-depth layer.
+        env:
+          CONFIRM:         ${{ inputs.confirm }}
+          CONFIRM_DESTROY: ${{ inputs.confirm_destroy }}
+          ENV_NAME:        ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          EXPECTED_CONFIRM='yes I have read the destroy plan'
+          EXPECTED_CONFIRM_DESTROY="yes destroy the ${ENV_NAME} infrastructure"
+          confirm_ok=1
+          confirm_destroy_ok=1
+          if [[ "$CONFIRM" != "$EXPECTED_CONFIRM" ]]; then
+            confirm_ok=0
+          fi
+          if [[ "$CONFIRM_DESTROY" != "$EXPECTED_CONFIRM_DESTROY" ]]; then
+            confirm_destroy_ok=0
+          fi
+          if [[ "$confirm_ok" == "0" ]]; then
+            echo "::error::confirm input must be exactly: ${EXPECTED_CONFIRM}"
+          fi
+          if [[ "$confirm_destroy_ok" == "0" ]]; then
+            echo "::error::confirm_destroy input must be exactly: ${EXPECTED_CONFIRM_DESTROY}"
+          fi
+          if [[ "$confirm_ok" == "0" || "$confirm_destroy_ok" == "0" ]]; then
+            echo "::error::See docs/staging-runbook.md §13.9 for the destroy procedure (env: ${ENV_NAME})."
+            exit 1
+          fi
+          echo "::notice::Both confirmation strings accepted for env=${ENV_NAME}. Proceeding with destroy."
+
+      - name: Resolve target ref
+        id: resolve
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          REPO:       ${{ github.repository }}
+          ENV_NAME:   ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$COMMIT_SHA" ]]; then
+            TARGET_SHA="$COMMIT_SHA"
+            SOURCE="operator-supplied commit_sha"
+          else
+            TARGET_SHA=$(gh api "repos/${REPO}/commits/main" --jq .sha)
+            SOURCE="HEAD of origin/main"
+          fi
+          if [[ -z "$TARGET_SHA" ]]; then
+            echo "::error::Failed to resolve target SHA."
+            exit 1
+          fi
+          echo "::notice::Resolved target_sha=${TARGET_SHA} (source: ${SOURCE})"
+          echo "target_sha=${TARGET_SHA}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Terraform Destroy (${ENV_NAME}) — resolving target"
+            echo ""
+            echo "- **Target SHA:** \`${TARGET_SHA}\`"
+            echo "- **Source:** ${SOURCE}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout source at resolved SHA
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.resolve.outputs.target_sha }}
+
+      - name: Defense-in-depth secret masking
+        env:
+          HCLOUD_TOKEN:        ${{ secrets.HCLOUD_TOKEN }}
+          HCP_TF_TOKEN:        ${{ secrets.HCP_TF_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # No `set -x` here — never trace this step's shell.
+          set -euo pipefail
+          echo "::add-mask::$HCLOUD_TOKEN"
+          echo "::add-mask::$HCP_TF_TOKEN"
+          if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "::add-mask::$DISCORD_WEBHOOK_URL"
+          fi
+
+      - name: Setup terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.10.5'
+          terraform_wrapper: false
+
+      - name: Discord notify start
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ steps.resolve.outputs.target_sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          SCOPE:               ${{ inputs.scope }}
+          ENV_NAME:            ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          # RED color even for "started" — destroy is dangerous enough
+          # that the dispatch itself deserves the alarm signal.
+          payload=$(jq -n \
+            --arg title "Terraform Destroy Started" \
+            --arg env "$ENV_NAME" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg scope "$SCOPE" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 15158332,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Scope",       value: $scope, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          # `|| true` — a Discord outage must NEVER fail the destroy step.
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: terraform init
+        id: tf-init
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io:   ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:                ${{ secrets.HCLOUD_TOKEN }}
+          # Even on destroy, terraform reads the variable schema and
+          # refuses unset required vars — set the JSON-encoded inputs
+          # here so init's downstream schema validation has them.
+          TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+          TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false
+
+      - name: terraform validate
+        id: tf-validate
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io:   ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:                ${{ secrets.HCLOUD_TOKEN }}
+          TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+          TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+        run: |
+          set -euo pipefail
+          terraform validate
+
+      - name: Capture pre-destroy VM IPv4
+        id: pre_destroy_ip
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io:   ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:                ${{ secrets.HCLOUD_TOKEN }}
+          TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+          TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+        run: |
+          set -euo pipefail
+          # `|| echo ""` tolerates an already-empty state (first run,
+          # prior failed destroy, vm_ipv4 output absent). The post-
+          # destroy known_hosts cleanup gates on this being non-empty.
+          IP=$(terraform output -raw vm_ipv4 2>/dev/null || echo "")
+          IP=$(echo "$IP" | tr -d '[:space:]')
+          echo "pre_destroy_ipv4=$IP" >> "$GITHUB_OUTPUT"
+          if [[ -n "$IP" ]]; then
+            echo "Pre-destroy VM IPv4: $IP — will be cleaned from runner ~/.ssh/known_hosts after destroy." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Pre-destroy VM IPv4: (empty — state already empty or no vm_ipv4 output)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: terraform destroy
+        id: tf-destroy
+        working-directory: ${{ inputs.tf_working_dir }}
+        env:
+          TF_TOKEN_app_terraform_io:   ${{ secrets.HCP_TF_TOKEN }}
+          HCLOUD_TOKEN:                ${{ secrets.HCLOUD_TOKEN }}
+          TF_VAR_ssh_allowed_cidrs:    ${{ inputs.ssh_allowed_cidrs }}
+          TF_VAR_operator_ssh_pubkeys: ${{ inputs.operator_ssh_pubkeys }}
+          SCOPE:                       ${{ inputs.scope }}
+          TARGETS:                     ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCOPE" == "targeted" ]]; then
+            if [[ -z "$TARGETS" ]]; then
+              echo "::error::scope=targeted requires the wrapper to forward a non-empty 'targets' input (comma-separated Terraform addresses)."
+              exit 1
+            fi
+            # Build -target=... flags from comma-separated input. Pipe
+            # through tr/sed only — values come from the wrapper, never
+            # user input, so this transform is closed under the input
+            # contract.
+            TARGET_FLAGS=$(echo "$TARGETS" | tr ',' '\n' | sed 's/^[[:space:]]*/-target=/' | tr '\n' ' ')
+            echo "::notice::Targeted destroy with flags: $TARGET_FLAGS"
+            # shellcheck disable=SC2086
+            # $TARGET_FLAGS expands intentionally to multiple -target=
+            # arguments; quoting would collapse them into one bad token.
+            terraform destroy -input=false -auto-approve -no-color $TARGET_FLAGS
+          elif [[ "$SCOPE" == "full" ]]; then
+            echo "::notice::Full destroy — every resource in the module."
+            terraform destroy -input=false -auto-approve -no-color
+          else
+            echo "::error::scope must be one of: targeted, full (got: $SCOPE)"
+            exit 1
+          fi
+
+      - name: Clean stale SSH known_hosts entry
+        if: success() && steps.pre_destroy_ip.outputs.pre_destroy_ipv4 != ''
+        env:
+          PRE_DESTROY_IPV4: ${{ steps.pre_destroy_ip.outputs.pre_destroy_ipv4 }}
+        run: |
+          set -euo pipefail
+          KH="$HOME/.ssh/known_hosts"
+          if [[ -f "$KH" ]]; then
+            ssh-keygen -R "$PRE_DESTROY_IPV4" -f "$KH" >/dev/null 2>&1 || true
+            echo "::notice::Cleared stale known_hosts entry for $PRE_DESTROY_IPV4"
+          else
+            echo "::notice::No ~/.ssh/known_hosts on runner — nothing to clean."
+          fi
+
+      - name: Write post-apply step summary
+        if: always()
+        env:
+          STATUS:   ${{ job.status }}
+          SCOPE:    ${{ inputs.scope }}
+          ENV_NAME: ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          {
+            if [[ "$STATUS" == "success" ]]; then
+              echo "### Terraform Destroy succeeded (env=${ENV_NAME}, scope=${SCOPE})"
+            else
+              echo "### Terraform Destroy FAILED (env=${ENV_NAME}, scope=${SCOPE})"
+              echo ""
+              echo "State may be inconsistent. Inspect HCP Terraform + the Hetzner Cloud Console BEFORE any further action."
+            fi
+            if [[ "$STATUS" == "success" && "$SCOPE" == "full" ]]; then
+              echo ""
+              echo "> Primary IP destroyed. Next: dispatch the env's terraform-apply wrapper to allocate a new IP, then update env vars + Cloudflare/DNS records (runbook §13.9 / §3.3)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Discord notify success
+        if: success()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ steps.resolve.outputs.target_sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          SCOPE:               ${{ inputs.scope }}
+          ENV_NAME:            ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          if [[ "$SCOPE" == "full" ]]; then
+            NEXT_STEP="Dispatch ${ENV_NAME}-terraform-apply.yml to re-allocate the primary IP. THEN update env vars + DNS records (runbook §3.3). THEN dispatch ${ENV_NAME}-deploy.yml."
+          else
+            NEXT_STEP="Dispatch ${ENV_NAME}-terraform-apply.yml to re-create the server (IP is preserved)."
+          fi
+          # ORANGE (15105570 = 0xe67e22). Destroy-success means env is
+          # now non-functional; green would mislead.
+          payload=$(jq -n \
+            --arg title "Terraform Destroy Succeeded — env is down" \
+            --arg env "$ENV_NAME" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg scope "$SCOPE" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            --arg next_step "$NEXT_STEP" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 15105570,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Scope",       value: $scope, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md},
+                  {name: "Next step",   value: $next_step}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: Discord notify failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ steps.resolve.outputs.target_sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          SCOPE:               ${{ inputs.scope }}
+          FAILED_JOB:          ${{ github.job }}
+          ENV_NAME:            ${{ inputs.env_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          if [[ -z "$COMMIT_SHA" ]]; then
+            SHA_SHORT="<unresolved>"
+            COMMIT_MD="\`<unresolved>\`"
+          else
+            SHA_SHORT="${COMMIT_SHA:0:7}"
+            COMMIT_MD="[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})"
+          fi
+          payload=$(jq -n \
+            --arg title "Terraform Destroy FAILED — state may be inconsistent" \
+            --arg env "$ENV_NAME" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg scope "$SCOPE" \
+            --arg commit_md "$COMMIT_MD" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            --arg failed_job "$FAILED_JOB" \
+            --arg next_step "Inspect HCP Terraform state + Hetzner Cloud Console BEFORE any further action. Partial destroy may have occurred." \
+            '{
+              embeds: [{
+                title: $title,
+                color: 15158332,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Scope",       value: $scope, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md},
+                  {name: "Failed job",  value: $failed_job, inline: true},
+                  {name: "Next step",   value: $next_step}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true

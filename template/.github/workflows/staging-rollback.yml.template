@@ -1,0 +1,560 @@
+# .github/workflows/staging-rollback.yml — per-service staging rollback.
+#
+# Sibling of staging-deploy.yml. Triggered ONLY by workflow_dispatch
+# (rollbacks are always intentional). Takes a `service` choice
+# (api/web/migrator), an optional `target_tag` (empty = last-known-good
+# read from the VM), and a `confirm_schema_compatible` gate that is
+# REQUIRED to be 'yes' when rolling back the migrator.
+#
+# Shares the staging-deploy concurrency group with the deploy workflow
+# so a deploy + rollback can never race; the second trigger queues.
+#
+# Operator setup + runbook: docs/scaffold-runbook.md (rollback +
+# forward-compatible migration policy sections).
+#
+# Adversarial-pass posture (mirrors staging-deploy.yml):
+# - Every secret + input passes through `env:` → bash, never `${{ }}`
+#   into a `run:` shell line directly. Script-injection hardening.
+# - `target_tag` is validated against `^[A-Za-z0-9._-]+$` before any
+#   use in sed/scp/ssh — rejects shell metacharacters.
+# - `::add-mask::` re-applied early as belt-and-suspenders.
+# - SSH `ssh-keyscan` is TOFU on first contact; same posture as deploy.
+# - Concurrency `cancel-in-progress: false` — never cancel a rollback
+#   mid-flight; second trigger queues.
+# - Every `sudo` call on the VM stays inside the sudoers allowlist
+#   seeded by terraform/modules/${PROJECT_NAME_LOWER}-env/cloud-init.yaml:
+#   install, rm -rf /tmp/${PROJECT_NAME_LOWER}-deploy.*, docker,
+#   systemctl.
+# - Quoted heredoc `<<'REMOTE'` + positional `bash -s "$arg"` to avoid
+#   the "double-expansion across the SSH boundary" footgun.
+#
+# ─────────────────────────────────────────────────────────────────────
+# RUNNER NOTE — this workflow ships defaulting to `runs-on: self-hosted`.
+#
+# To run on GitHub-hosted infrastructure instead:
+#   1. Replace every `runs-on: self-hosted` line in this file with
+#      `runs-on: ubuntu-latest`. NOTE: the rollback steps assume the
+#      runner can reach the VM over SSH — confirm GitHub-hosted runner
+#      egress is permitted by the VM firewall (operator-managed via
+#      STAGING_SSH_ALLOWED_CIDRS).
+#   2. (If applicable) delete .github/workflows/runner-cache-cleanup.yml
+#      entirely — it only manages a self-hosted runner's local cache.
+#   3. See docs/scaffold-runbook.md → "Switching from self-hosted to
+#      GitHub-hosted runners" for the full migration steps.
+# ─────────────────────────────────────────────────────────────────────
+
+name: Staging Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        type: choice
+        description: 'Which service to roll back'
+        required: true
+        options:
+          - api
+          - web
+          - migrator
+      target_tag:
+        type: string
+        description: 'Tag to roll back to (empty = last-known-good from VM)'
+        required: false
+        default: ''
+      confirm_schema_compatible:
+        type: choice
+        description: 'Migrator ONLY: type "yes" to confirm forward-compat policy holds (see runbook)'
+        required: false
+        default: 'no'
+        options:
+          - 'no'
+          - 'yes'
+
+# Same group as staging-deploy — deploys + rollbacks queue, never race.
+concurrency:
+  group: ${PROJECT_NAME_LOWER}-staging-deploy
+  cancel-in-progress: false
+
+# Least privilege. Image pulls happen on the VM with the auto-issued
+# GITHUB_TOKEN scoped to `packages: read`.
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  rollback:
+    runs-on: self-hosted        # consistent with cicd.yml + staging-deploy.yml
+    environment: staging        # gates secrets + vars to the staging Environment
+    timeout-minutes: 10
+    steps:
+      - name: Migrator rollback safety gate
+        if: inputs.service == 'migrator'
+        env:
+          CONFIRM: ${{ inputs.confirm_schema_compatible }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRM" != "yes" ]]; then
+            echo "::error::Migrator rollback requires confirm_schema_compatible=yes."
+            echo "::error::Read docs/scaffold-runbook.md (forward-compatible migration policy) BEFORE proceeding."
+            echo "::error::Migration policy is forward-compatible-only: older API code SHOULD work against newer schema, but rolling the migrator container back does NOT roll the schema back."
+            exit 1
+          fi
+          echo "::warning::Migrator rollback confirmed by operator. Assuming forward-compatible-migration policy holds."
+
+      - name: Validate service input (defense in depth)
+        env:
+          SVC: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          case "$SVC" in
+            api|web|migrator)
+              echo "::notice::Service: $SVC"
+              ;;
+            *)
+              echo "::error::Unknown service: '$SVC'. Allowed: api, web, migrator."
+              exit 1
+              ;;
+          esac
+
+      - name: Validate required Environment variables
+        env:
+          VM_IP:        ${{ vars.STAGING_VM_IP }}
+          API_HOSTNAME: ${{ vars.STAGING_API_HOSTNAME }}
+          WEB_HOSTNAME: ${{ vars.STAGING_WEB_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -z "${VM_IP:-}" ]] && missing+=("STAGING_VM_IP")
+          [[ -z "${API_HOSTNAME:-}" ]] && missing+=("STAGING_API_HOSTNAME")
+          [[ -z "${WEB_HOSTNAME:-}" ]] && missing+=("STAGING_WEB_HOSTNAME")
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Missing required Environment vars: ${missing[*]}"
+            echo "::error::Set under Settings -> Environments -> staging -> Variables"
+            exit 1
+          fi
+
+      - name: Defense-in-depth secret masking
+        env:
+          GHCR_TOKEN:          ${{ secrets.GITHUB_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # No `set -x` here — never trace this step's shell.
+          set -euo pipefail
+          echo "::add-mask::$GHCR_TOKEN"
+          # Discord webhook URL embeds a token — mask if present. Empty =
+          # silent no-op (notifications are an optional secret).
+          if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "::add-mask::$DISCORD_WEBHOOK_URL"
+          fi
+
+      - name: Discord notify start
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ github.sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          SVC:                 ${{ inputs.service }}
+          TARGET_TAG:          ${{ inputs.target_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          # Empty target_tag means "use LKG"; surface that intent to the operator.
+          TARGET_DISPLAY="${TARGET_TAG:-(LKG)}"
+          payload=$(jq -n \
+            --arg title "Staging rollback started" \
+            --arg env "staging" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            --arg svc "$SVC" \
+            --arg target "$TARGET_DISPLAY" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 3447003,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Service",     value: $svc, inline: true},
+                  {name: "Target tag",  value: $target, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: Prepare SSH key + known_hosts (TOFU)
+        env:
+          SSH_KEY: ${{ secrets.STAGING_DEPLOY_SSH_KEY }}
+          VM_IP:   ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/staging
+          chmod 0600 ~/.ssh/staging
+          # TOFU known_hosts — same posture as staging-deploy.yml.
+          ssh-keyscan -H "$VM_IP" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Verify VM cloud-init complete
+        env:
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          if ! ssh -i ~/.ssh/staging "deploy@$VM_IP" 'test -f /var/lib/${PROJECT_NAME_LOWER}/.bootstrap-complete'; then
+            echo "::error::VM has not finished cloud-init (no /var/lib/${PROJECT_NAME_LOWER}/.bootstrap-complete marker)."
+            echo "::error::Re-run terraform apply or inspect /var/log/cloud-init-output.log on the VM."
+            exit 1
+          fi
+
+      - name: Resolve target tag
+        id: target
+        env:
+          SVC:       ${{ inputs.service }}
+          INPUT_TAG: ${{ inputs.target_tag }}
+          VM_IP:     ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          # Map service to the env-var name written in /etc/${PROJECT_NAME_LOWER}/.env.staging
+          # and in /etc/${PROJECT_NAME_LOWER}/last-known-good-<svc>.env.
+          case "$SVC" in
+            api)      VAR=API_VERSION ;;
+            web)      VAR=WEB_VERSION ;;
+            migrator) VAR=MIGRATOR_VERSION ;;
+          esac
+
+          if [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+            echo "::notice::Using operator-supplied target_tag: $TAG"
+          else
+            # LKG files are mode 0644 root:deploy — readable by deploy w/o sudo.
+            # Parse defensively: grep anchored to `^<VAR>=`, take everything
+            # after the first `=`.
+            LKG_PATH="/etc/${PROJECT_NAME_LOWER}/last-known-good-${SVC}.env"
+            TAG=$(ssh -i ~/.ssh/staging "deploy@$VM_IP" \
+                  "grep -E '^${VAR}=' '$LKG_PATH' 2>/dev/null | head -n1 | cut -d= -f2-" \
+                  || true)
+            if [[ -z "$TAG" ]]; then
+              echo "::error::No last-known-good tag recorded for $SVC at $LKG_PATH."
+              echo "::error::Either this service has never been deployed, or the file is corrupt."
+              echo "::error::Provide an explicit target_tag input. See docs/scaffold-runbook.md (rollback section)."
+              exit 1
+            fi
+            echo "::notice::Resolved last-known-good tag for $SVC: $TAG"
+          fi
+
+          # Validate the tag shape BEFORE using it in sed/scp/ssh. Rejects
+          # shell metacharacters and anything outside the GHCR tag charset
+          # the cicd.yml workflow emits (sha-<7> + semver-ish variants).
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::target tag '$TAG' contains characters outside [A-Za-z0-9._-]."
+            echo "::error::Refusing to use a potentially-unsafe tag in subsequent commands."
+            exit 1
+          fi
+
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+          echo "VAR=$VAR" >> "$GITHUB_OUTPUT"
+
+      - name: GHCR login on VM
+        env:
+          VM_IP:      ${{ vars.STAGING_VM_IP }}
+          # GITHUB_TOKEN with `packages: read` (declared above) — see
+          # staging-deploy.yml's `GHCR login on VM` step for the rationale.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER:  ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          REMOTE="deploy@$VM_IP"
+          # Pipe token through stdin — never appears in argv on remote `ps`.
+          printf '%s' "$GHCR_TOKEN" | ssh -i ~/.ssh/staging "$REMOTE" \
+            "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+
+      - name: Pull target image for rolled service
+        env:
+          SVC:   ${{ inputs.service }}
+          TAG:   ${{ steps.target.outputs.TAG }}
+          VAR:   ${{ steps.target.outputs.VAR }}
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          # Pull BEFORE writing the new .env.staging on the VM. If the pull
+          # fails, /etc/${PROJECT_NAME_LOWER}/.env.staging still matches the
+          # running container.
+          ssh -i ~/.ssh/staging "deploy@$VM_IP" \
+            "cd /srv/${PROJECT_NAME_LOWER} && ${VAR}=${TAG} docker compose -f docker-compose.yml -f docker-compose.staging.yml --env-file /etc/${PROJECT_NAME_LOWER}/.env.staging pull $SVC"
+
+      - name: Update .env.staging on VM (read on runner, sed, install via scratch)
+        env:
+          SVC:   ${{ inputs.service }}
+          TAG:   ${{ steps.target.outputs.TAG }}
+          VAR:   ${{ steps.target.outputs.VAR }}
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          REMOTE="deploy@$VM_IP"
+
+          # Read current /etc/${PROJECT_NAME_LOWER}/.env.staging — file is
+          # 0640 root:deploy; plain `cat` over SSH suffices (no sudo needed).
+          LOCAL_ENV=$(mktemp)
+          ssh -i ~/.ssh/staging "$REMOTE" 'cat /etc/${PROJECT_NAME_LOWER}/.env.staging' > "$LOCAL_ENV"
+
+          # Pre-flight: refuse if the line we want to replace isn't there.
+          # Prevents silently writing a malformed file.
+          if ! grep -qE "^${VAR}=" "$LOCAL_ENV"; then
+            echo "::error::/etc/${PROJECT_NAME_LOWER}/.env.staging on VM has no ${VAR}= line."
+            echo "::error::Refusing to write a file missing the rollback target line."
+            rm -f "$LOCAL_ENV"
+            exit 1
+          fi
+
+          # Strict anchored sed using `|` delimiter — `|` cannot appear in
+          # TAG (regex above guarantees [A-Za-z0-9._-]).
+          sed -i "s|^${VAR}=.*|${VAR}=${TAG}|" "$LOCAL_ENV"
+
+          # SCP to fresh scratch dir on the VM.
+          REMOTE_SCRATCH=$(ssh -i ~/.ssh/staging "$REMOTE" 'd=$(mktemp -d /tmp/${PROJECT_NAME_LOWER}-deploy.XXXXXX); echo "$d"')
+          echo "REMOTE_SCRATCH=$REMOTE_SCRATCH" >> "$GITHUB_ENV"
+          scp -i ~/.ssh/staging "$LOCAL_ENV" "$REMOTE:$REMOTE_SCRATCH/.env.staging"
+          rm -f "$LOCAL_ENV"
+
+          # Atomic install — same mode/owner/group as the deploy workflow
+          # writes. Quoted heredoc + positional arg avoids the expansion footgun.
+          ssh -i ~/.ssh/staging "$REMOTE" bash -s "$REMOTE_SCRATCH" <<'REMOTE'
+          set -euo pipefail
+          scratch="$1"
+          sudo install -m 0640 -o root -g deploy "$scratch/.env.staging" /etc/${PROJECT_NAME_LOWER}/.env.staging
+          REMOTE
+
+      - name: Restart rolled service (or re-run migrator)
+        env:
+          SVC:   ${{ inputs.service }}
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          if [[ "$SVC" == "migrator" ]]; then
+            # Migrator is a one-shot — `run --rm` ensures no leftover
+            # container blocks subsequent rollbacks. Non-zero exit aborts
+            # before LKG writeback.
+            if ! ssh -i ~/.ssh/staging "deploy@$VM_IP" \
+                "cd /srv/${PROJECT_NAME_LOWER} && docker compose -f docker-compose.yml -f docker-compose.staging.yml --env-file /etc/${PROJECT_NAME_LOWER}/.env.staging --profile migrate run --rm migrator"; then
+              echo "::error::Migrator rollback failed (non-zero exit)."
+              echo "::error::SSH in and inspect 'docker logs ${PROJECT_NAME_LOWER}-migrator' (most recent)."
+              exit 1
+            fi
+          else
+            # `--no-deps` is the explicit "don't touch dependencies" flag.
+            ssh -i ~/.ssh/staging "deploy@$VM_IP" \
+              "cd /srv/${PROJECT_NAME_LOWER} && docker compose -f docker-compose.yml -f docker-compose.staging.yml --env-file /etc/${PROJECT_NAME_LOWER}/.env.staging up -d --no-deps $SVC"
+          fi
+
+      - name: Health probe (api/web only, 60s budget)
+        if: inputs.service != 'migrator'
+        env:
+          SVC:          ${{ inputs.service }}
+          API_HOSTNAME: ${{ vars.STAGING_API_HOSTNAME }}
+          WEB_HOSTNAME: ${{ vars.STAGING_WEB_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          case "$SVC" in
+            api) URL="https://${API_HOSTNAME}/health-live" ;;
+            web) URL="https://${WEB_HOSTNAME}/" ;;
+          esac
+          code=000
+          for i in $(seq 1 30); do
+            # -k accepts LE-staging / tls-internal cert (browser-distrusted
+            # but cryptographically valid). Same posture as deploy.
+            code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$URL" || echo 000)
+            if [[ "$code" == "200" ]]; then
+              echo "::notice::$SVC healthy after $((i*2))s (code=$code)"
+              exit 0
+            fi
+            echo "Attempt $i/30: $SVC code=$code - retrying in 2s"
+            sleep 2
+          done
+          echo "::error::$SVC failed health probe after 60s (last code=$code)."
+          echo "::error::Triage: ssh in, run 'docker compose -f /srv/${PROJECT_NAME_LOWER}/docker-compose.yml -f /srv/${PROJECT_NAME_LOWER}/docker-compose.staging.yml logs --tail=200 $SVC'."
+          exit 1
+
+      - name: Update last-known-good for rolled service
+        if: success()
+        env:
+          SVC:   ${{ inputs.service }}
+          TAG:   ${{ steps.target.outputs.TAG }}
+          VAR:   ${{ steps.target.outputs.VAR }}
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          REMOTE="deploy@$VM_IP"
+          # Build the new LKG line locally on the runner: variable expansion
+          # happens in deterministic bash, never across the SSH boundary.
+          LKG_LOCAL=$(mktemp -d)
+          printf '%s=%s\n' "$VAR" "$TAG" > "$LKG_LOCAL/last-known-good-${SVC}.env"
+
+          # Reuse the same scratch dir from the .env.staging step. It is
+          # /tmp/${PROJECT_NAME_LOWER}-deploy.* which is covered by sudoers.
+          scp -i ~/.ssh/staging "$LKG_LOCAL/last-known-good-${SVC}.env" \
+            "$REMOTE:$REMOTE_SCRATCH/last-known-good-${SVC}.env"
+          rm -rf "$LKG_LOCAL"
+
+          ssh -i ~/.ssh/staging "$REMOTE" bash -s "$REMOTE_SCRATCH" "$SVC" <<'REMOTE'
+          set -euo pipefail
+          scratch="$1"
+          svc="$2"
+          # 0644 root:deploy mirrors staging-deploy.yml.
+          sudo install -m 0644 -o root -g deploy \
+            "$scratch/last-known-good-${svc}.env" \
+            "/etc/${PROJECT_NAME_LOWER}/last-known-good-${svc}.env"
+          # Sudoers permits `rm -rf /tmp/${PROJECT_NAME_LOWER}-deploy.*`.
+          sudo rm -rf "$scratch"
+          REMOTE
+
+      - name: Cleanup remote scratch on failure
+        if: failure() && env.REMOTE_SCRATCH != ''
+        env:
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          # Best-effort cleanup if a downstream step failed before LKG
+          # writeback removed the scratch dir. Sudoers covers
+          # `rm -rf /tmp/${PROJECT_NAME_LOWER}-deploy.*`. Ignore failures.
+          ssh -i ~/.ssh/staging "deploy@$VM_IP" "sudo rm -rf '$REMOTE_SCRATCH'" || true
+
+      - name: Discord notify failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ github.sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          SVC:                 ${{ inputs.service }}
+          TARGET_TAG:          ${{ steps.target.outputs.TAG }}
+          FAILED_JOB:          ${{ github.job }}
+        run: |
+          set -euo pipefail
+          # Cleanup runs first (above); notify runs second so cleanup never
+          # gets skipped if notify hangs/fails.
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          TARGET_DISPLAY="${TARGET_TAG:-<unresolved>}"
+          payload=$(jq -n \
+            --arg title "Staging rollback failed" \
+            --arg env "staging" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            --arg svc "$SVC" \
+            --arg target "$TARGET_DISPLAY" \
+            --arg failed_job "$FAILED_JOB" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 15158332,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Service",     value: $svc, inline: true},
+                  {name: "Target tag",  value: $target, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md},
+                  {name: "Failed job",  value: $failed_job, inline: true}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: Write step summary
+        if: always()
+        env:
+          SVC:    ${{ inputs.service }}
+          TAG:    ${{ steps.target.outputs.TAG }}
+          STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## Staging Rollback"
+            echo ""
+            echo "**Status:** ${STATUS}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Service | \`${SVC}\` |"
+            echo "| Rolled to tag | \`${TAG:-<unresolved>}\` |"
+            echo "| Other services | unchanged |"
+            echo ""
+            if [[ "$SVC" == "migrator" ]]; then
+              echo "> Migrator rollback executed. Verify API can still talk to the schema; if not, **deploy forward** to the original tag via staging-deploy.yml (workflow_dispatch with \`commit_sha\`)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Discord notify success
+        if: success()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ github.sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          SVC:                 ${{ inputs.service }}
+          TARGET_TAG:          ${{ steps.target.outputs.TAG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          payload=$(jq -n \
+            --arg title "Staging rollback succeeded" \
+            --arg env "staging" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            --arg svc "$SVC" \
+            --arg target "$TARGET_TAG" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 3066993,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Service",     value: $svc, inline: true},
+                  {name: "Rolled to",   value: $target, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true

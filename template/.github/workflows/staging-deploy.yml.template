@@ -1,0 +1,702 @@
+# .github/workflows/staging-deploy.yml — CD-to-staging pipeline.
+#
+# Triggered automatically after cicd.yml succeeds on main; also runnable
+# manually with optional commit_sha + skip_migrator inputs. Trusts the
+# predecessor cicd.yml to have published GHCR images tagged
+# `sha-<7-char-short>` (see cicd.yml's docker/metadata-action config).
+#
+# Operator setup: docs/scaffold-runbook.md (staging env section).
+#
+# Adversarial-pass posture:
+# - Every secret value passes through `env:` → bash, never `${{ }}` into
+#   a `run:` shell line directly. Script-injection hardening.
+# - `::add-mask::` re-applied early as belt-and-suspenders.
+# - `envsubst` ALWAYS called with an EXPLICIT ALLOWLIST so an unexpected
+#   `${HOME}`-shaped placeholder doesn't silently substitute to empty.
+# - SSH `ssh-keyscan` is TOFU on first deploy. Documented; replaced by a
+#   pinned STAGING_KNOWN_HOSTS secret in a deferred future intent. After
+#   `terraform destroy && apply`, operator removes runner-side
+#   ~/.ssh/known_hosts to clear stale entries.
+# - Concurrency `cancel-in-progress: false` so simultaneous trigger queues;
+#   never partial-deploys.
+# - Every `sudo` call on the VM stays inside the sudoers allowlist seeded
+#   by terraform/staging/cloud-init.yaml: install, rm /tmp/*, docker,
+#   systemctl.
+#
+# Required GitHub Environment variables (Settings → Environments → staging
+# → Variables): STAGING_VM_IP, STAGING_API_HOSTNAME, STAGING_WEB_HOSTNAME.
+#
+# Required repository variable (Settings → Secrets and variables → Actions
+# → Variables tab): STAGING_DEPLOY_ENABLED — set to `true` to enable
+# auto-deploy on cicd-main success. Default (unset/empty) is OFF.
+#
+# Required secrets: STAGING_DEPLOY_SSH_KEY, APP_ADMIN_PASSWORD,
+# CONNECTION_STRING_DEFAULT, AUTHSERVER_CERT_PASSPHRASE,
+# STRINGENCRYPT_PASSPHRASE, POSTGRES_PASSWORD, OPENIDDICT_PFX_BASE64.
+# Optional: SENTRY_DSN, SENTRY_INGEST_ORIGIN, DISCORD_WEBHOOK_URL.
+#
+# ─────────────────────────────────────────────────────────────────────
+# RUNNER NOTE — this workflow ships defaulting to `runs-on: self-hosted`.
+#
+# To run on GitHub-hosted infrastructure instead:
+#   1. Replace every `runs-on: self-hosted` line in this file with
+#      `runs-on: ubuntu-latest`. NOTE: the deploy steps assume the
+#      runner can reach the VM over SSH — confirm GitHub-hosted runner
+#      egress is permitted by the VM firewall (operator-managed via
+#      STAGING_SSH_ALLOWED_CIDRS).
+#   2. (If applicable) delete .github/workflows/runner-cache-cleanup.yml
+#      entirely — it only manages a self-hosted runner's local cache.
+#   3. See docs/scaffold-runbook.md → "Switching from self-hosted to
+#      GitHub-hosted runners" for the full migration steps.
+# ─────────────────────────────────────────────────────────────────────
+
+name: Staging Deploy
+
+on:
+  # AUTO-TRIGGER: fires after cicd.yml completes on main. The `if:` on
+  # the job filters to conclusion == success.
+  workflow_run:
+    workflows: [CICD]        # MUST match cicd.yml's `name:` exactly
+    types: [completed]
+    branches: [main]
+  # MANUAL TRIGGER: redeploy an existing commit without a new merge.
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        type: string
+        description: 'Full commit SHA to deploy (empty = floating :main tag, the most recent successful main build of each image)'
+        required: false
+      skip_migrator:
+        type: boolean
+        description: 'Skip migrator step (only when schema unchanged)'
+        default: false
+
+# Queue concurrent triggers (workflow_run + workflow_dispatch); never cancel
+# a deploy mid-flight. A second trigger waits for the first to finish.
+# Shared group with staging-rollback + staging-terraform-apply +
+# staging-terraform-destroy so the four serialize.
+concurrency:
+  group: ${PROJECT_NAME_LOWER}-staging-deploy
+  cancel-in-progress: false
+
+# Least privilege. `packages: read` lets `secrets.GITHUB_TOKEN` pull
+# our same-org GHCR images. The packages are auto-linked to this repo by
+# cicd.yml's push step using the same token, so any workflow in this repo
+# with the read scope can pull them — no per-operator PAT to manage.
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    runs-on: self-hosted       # consistent with cicd.yml
+    environment: staging       # gates secrets + vars to the staging Environment
+    timeout-minutes: 15
+    # Skip when the source workflow_run did not succeed. workflow_dispatch
+    # always runs (operator initiated).
+    #
+    # AUTO-DEPLOY KILL SWITCH: the workflow_run path is also gated by
+    # `vars.STAGING_DEPLOY_ENABLED == 'true'`. Default (var unset/empty) is
+    # OFF — auto-deploy on cicd success will NOT fire until the operator
+    # flips this var.
+    #
+    # NOTE: the variable MUST be at the **repository level**
+    # (Settings → Secrets and variables → Actions → Variables tab → "New
+    # repository variable"), NOT on the `staging` deployment Environment.
+    # GitHub Actions does not expose environment-scoped variables to
+    # job-level `if:` expressions because the environment isn't bound
+    # until the job actually starts running — and `if:` evaluation gates
+    # whether the job runs at all. An env-scoped `STAGING_DEPLOY_ENABLED`
+    # silently evaluates to empty here and the deploy is permanently
+    # skipped regardless of its value.
+    #
+    # Manual `workflow_dispatch` always runs regardless of this gate, so
+    # you can still drive deploys by hand if the variable is missing.
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'workflow_run'
+          && github.event.workflow_run.conclusion == 'success'
+          && vars.STAGING_DEPLOY_ENABLED == 'true')
+    steps:
+      - name: Checkout source at resolved SHA
+        uses: actions/checkout@v6
+        with:
+          # workflow_run → cicd's head_sha; workflow_dispatch → input or HEAD.
+          ref: ${{ github.event.workflow_run.head_sha || inputs.commit_sha || github.sha }}
+
+      - name: Validate required Environment variables
+        env:
+          VM_IP:        ${{ vars.STAGING_VM_IP }}
+          API_HOSTNAME: ${{ vars.STAGING_API_HOSTNAME }}
+          WEB_HOSTNAME: ${{ vars.STAGING_WEB_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -z "${VM_IP:-}" ]] && missing+=("STAGING_VM_IP")
+          [[ -z "${API_HOSTNAME:-}" ]] && missing+=("STAGING_API_HOSTNAME")
+          [[ -z "${WEB_HOSTNAME:-}" ]] && missing+=("STAGING_WEB_HOSTNAME")
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Missing required Environment vars: ${missing[*]}"
+            echo "::error::Set under Settings -> Environments -> staging -> Variables"
+            exit 1
+          fi
+
+      - name: Defense-in-depth secret masking
+        env:
+          APP_ADMIN_PASSWORD:         ${{ secrets.APP_ADMIN_PASSWORD }}
+          CONNECTION_STRING_DEFAULT:  ${{ secrets.CONNECTION_STRING_DEFAULT }}
+          AUTHSERVER_CERT_PASSPHRASE: ${{ secrets.AUTHSERVER_CERT_PASSPHRASE }}
+          STRINGENCRYPT_PASSPHRASE:   ${{ secrets.STRINGENCRYPT_PASSPHRASE }}
+          POSTGRES_PASSWORD:          ${{ secrets.POSTGRES_PASSWORD }}
+          PFX_B64:                    ${{ secrets.OPENIDDICT_PFX_BASE64 }}
+          DISCORD_WEBHOOK_URL:        ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # No `set -x` here — never trace this step's shell.
+          set -euo pipefail
+          echo "::add-mask::$APP_ADMIN_PASSWORD"
+          echo "::add-mask::$CONNECTION_STRING_DEFAULT"
+          echo "::add-mask::$AUTHSERVER_CERT_PASSPHRASE"
+          echo "::add-mask::$STRINGENCRYPT_PASSPHRASE"
+          echo "::add-mask::$POSTGRES_PASSWORD"
+          # Mask first 32 chars of pfx base64 — defense against partial-log
+          # of binary content.
+          echo "::add-mask::${PFX_B64:0:32}"
+          # Discord webhook URL embeds a token — mask if present. Empty =
+          # silent no-op (notifications are an optional secret).
+          if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "::add-mask::$DISCORD_WEBHOOK_URL"
+          fi
+
+      - name: Discord notify start
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ github.event.workflow_run.head_sha || inputs.commit_sha || github.sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          # Optional secret — absence is the toggle. Silent no-op when unset.
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          payload=$(jq -n \
+            --arg title "Staging deploy started" \
+            --arg env "staging" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 3447003,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          # `|| true` — a Discord outage must NEVER fail the deploy step.
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: Determine target image tag
+        id: tags
+        env:
+          # workflow_run: head_sha of the cicd run that just finished. SHA-pinned, what just built.
+          # workflow_dispatch with commit_sha: operator-supplied SHA. SHA-pinned.
+          # workflow_dispatch with empty commit_sha: empty here → fall through to :main per package.
+          EXPLICIT_SHA: ${{ github.event.workflow_run.head_sha || inputs.commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$EXPLICIT_SHA" ]]; then
+            # Explicit SHA — pin all three components. Same SHA across packages
+            # assumes cicd.yml's path-filter built all three for that commit.
+            # If it didn't (e.g., backend-only change → no web image at this
+            # SHA), the next "Pull all images" step fails with `manifest unknown`
+            # and the operator should re-dispatch with an empty commit_sha to
+            # use the floating :main per package instead.
+            SHORT="${EXPLICIT_SHA:0:7}"
+            API_TAG="sha-$SHORT"
+            WEB_TAG="sha-$SHORT"
+            MIGRATOR_TAG="sha-$SHORT"
+            SOURCE_DESC="sha=$EXPLICIT_SHA"
+            RESOLUTION="explicit-sha"
+          else
+            # No SHA — use the floating :main tag per package. cicd.yml's
+            # docker/metadata-action publishes :main on every successful main
+            # build, atomically replacing the previous :main. This gives
+            # "most recent main build of each component" with zero risk of
+            # `manifest unknown` and zero need for per-package SHA resolution
+            # at deploy time.
+            API_TAG="main"
+            WEB_TAG="main"
+            MIGRATOR_TAG="main"
+            # Resolve the underlying SHA each :main currently points at, for
+            # display only (operators want to know what they're shipping).
+            # `gh api` uses GITHUB_TOKEN with packages: read — sufficient for
+            # listing same-org container package versions.
+            resolve_main_sha() {
+              local pkg="$1"
+              gh api "/orgs/${REPO_OWNER}/packages/container/${pkg}/versions?per_page=30" \
+                --jq '[.[] | select(.metadata.container.tags // [] | index("main"))][0] | (.metadata.container.tags // [])[] | select(startswith("sha-"))' 2>/dev/null \
+                | head -1 \
+                || echo "?"
+            }
+            API_SHA=$(resolve_main_sha ${PROJECT_NAME_LOWER}-api)
+            WEB_SHA=$(resolve_main_sha ${PROJECT_NAME_LOWER}-web)
+            MIGRATOR_SHA=$(resolve_main_sha ${PROJECT_NAME_LOWER}-dbmigrator)
+            SOURCE_DESC="auto :main (api=${API_SHA:-?} web=${WEB_SHA:-?} migrator=${MIGRATOR_SHA:-?})"
+            RESOLUTION="auto-main-per-package"
+          fi
+          {
+            echo "API_VERSION=$API_TAG"
+            echo "WEB_VERSION=$WEB_TAG"
+            echo "MIGRATOR_VERSION=$MIGRATOR_TAG"
+            echo "SOURCE_SHA=$SOURCE_DESC"
+            echo "RESOLUTION=$RESOLUTION"
+            echo "API_TAG=$API_TAG"
+            echo "WEB_TAG=$WEB_TAG"
+            echo "MIGRATOR_TAG=$MIGRATOR_TAG"
+            echo "API_SHA=${API_SHA:-}"
+            echo "WEB_SHA=${WEB_SHA:-}"
+            echo "MIGRATOR_SHA=${MIGRATOR_SHA:-}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Image tags"
+            echo ""
+            echo "**Resolution:** \`$RESOLUTION\`"
+            echo ""
+            echo "| Component | Tag | Underlying SHA |"
+            echo "|---|---|---|"
+            echo "| api      | \`$API_TAG\`      | \`${API_SHA:-$API_TAG}\` |"
+            echo "| web      | \`$WEB_TAG\`      | \`${WEB_SHA:-$WEB_TAG}\` |"
+            echo "| migrator | \`$MIGRATOR_TAG\` | \`${MIGRATOR_SHA:-$MIGRATOR_TAG}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::Deploying ($RESOLUTION): api=$API_TAG web=$WEB_TAG migrator=$MIGRATOR_TAG"
+          if [[ -n "${API_SHA:-}" || -n "${WEB_SHA:-}" || -n "${MIGRATOR_SHA:-}" ]]; then
+            echo "::notice::Underlying SHAs: api=${API_SHA:-?} web=${WEB_SHA:-?} migrator=${MIGRATOR_SHA:-?}"
+          fi
+
+      - name: Render API appsettings.secrets.json
+        env:
+          APP_ADMIN_PASSWORD:         ${{ secrets.APP_ADMIN_PASSWORD }}
+          CONNECTION_STRING_DEFAULT:  ${{ secrets.CONNECTION_STRING_DEFAULT }}
+          AUTHSERVER_CERT_PASSPHRASE: ${{ secrets.AUTHSERVER_CERT_PASSPHRASE }}
+          STRINGENCRYPT_PASSPHRASE:   ${{ secrets.STRINGENCRYPT_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          # Explicit allowlist form. Any `$VAR` in the template not in this
+          # list is emitted LITERALLY — desired behavior. A stray `$HOME`
+          # won't silently expand to /home/runner.
+          # shellcheck disable=SC2016
+          # The single-quoted ${VAR} list IS the envsubst allowlist syntax —
+          # those refs must NOT expand in the shell. Disable SC2016 here.
+          envsubst '${APP_ADMIN_PASSWORD} ${CONNECTION_STRING_DEFAULT} ${AUTHSERVER_CERT_PASSPHRASE} ${STRINGENCRYPT_PASSPHRASE}' \
+            < src/${PROJECT_NAME}.HttpApi.Host/appsettings.secrets.staging.json.template \
+            > /tmp/api.secrets.json
+          # JSON-parse catches malformed output (e.g., quote inside a value
+          # that wasn't escaped, or an unexpected `${X}` left literal).
+          python3 -c "import json; json.load(open('/tmp/api.secrets.json'))"
+
+      - name: Render Migrator appsettings.secrets.json
+        env:
+          APP_ADMIN_PASSWORD:        ${{ secrets.APP_ADMIN_PASSWORD }}
+          CONNECTION_STRING_DEFAULT: ${{ secrets.CONNECTION_STRING_DEFAULT }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016
+          # The single-quoted ${VAR} list IS the envsubst allowlist syntax.
+          envsubst '${APP_ADMIN_PASSWORD} ${CONNECTION_STRING_DEFAULT}' \
+            < src/${PROJECT_NAME}.DbMigrator/appsettings.secrets.staging.json.template \
+            > /tmp/migrator.secrets.json
+          python3 -c "import json; json.load(open('/tmp/migrator.secrets.json'))"
+
+      - name: Decode openiddict.pfx from base64
+        env:
+          PFX_B64: ${{ secrets.OPENIDDICT_PFX_BASE64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PFX_B64" | base64 -d > /tmp/openiddict.pfx
+          if [[ ! -s /tmp/openiddict.pfx ]]; then
+            echo "::error::pfx decode produced empty file"
+            exit 1
+          fi
+
+      - name: Render .env.staging
+        env:
+          API_VERSION:            ${{ steps.tags.outputs.API_VERSION }}
+          WEB_VERSION:            ${{ steps.tags.outputs.WEB_VERSION }}
+          MIGRATOR_VERSION:       ${{ steps.tags.outputs.MIGRATOR_VERSION }}
+          POSTGRES_PASSWORD:      ${{ secrets.POSTGRES_PASSWORD }}
+          SENTRY_DSN:             ${{ secrets.SENTRY_DSN }}
+          SENTRY_INGEST_ORIGIN:   ${{ secrets.SENTRY_INGEST_ORIGIN }}
+          APP_API_HOSTNAME:       ${{ vars.STAGING_API_HOSTNAME }}
+          APP_WEB_HOSTNAME:       ${{ vars.STAGING_WEB_HOSTNAME }}
+          APP_API_PUBLIC_URL:     https://${{ vars.STAGING_API_HOSTNAME }}
+          APP_WEB_PUBLIC_URL:     https://${{ vars.STAGING_WEB_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016
+          # The single-quoted ${VAR} list IS the envsubst allowlist syntax.
+          envsubst '${API_VERSION} ${WEB_VERSION} ${MIGRATOR_VERSION} ${POSTGRES_PASSWORD} ${SENTRY_DSN} ${SENTRY_INGEST_ORIGIN} ${APP_API_HOSTNAME} ${APP_WEB_HOSTNAME} ${APP_API_PUBLIC_URL} ${APP_WEB_PUBLIC_URL}' \
+            < .env.staging.template > /tmp/.env.staging
+
+      - name: Prepare SSH key + known_hosts (TOFU)
+        env:
+          SSH_KEY: ${{ secrets.STAGING_DEPLOY_SSH_KEY }}
+          VM_IP:   ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/staging
+          chmod 0600 ~/.ssh/staging
+          # TOFU known_hosts — until a pinned STAGING_KNOWN_HOSTS secret is
+          # wired, the runner trusts whatever host key the VM presents on
+          # first contact.
+          ssh-keyscan -H "$VM_IP" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Verify VM cloud-init complete
+        env:
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          if ! ssh -i ~/.ssh/staging "deploy@$VM_IP" 'test -f /var/lib/${PROJECT_NAME_LOWER}/.bootstrap-complete'; then
+            echo "::error::VM has not finished cloud-init (no /var/lib/${PROJECT_NAME_LOWER}/.bootstrap-complete marker)."
+            echo "::error::Re-run terraform apply or inspect /var/log/cloud-init-output.log on the VM."
+            exit 1
+          fi
+
+      - name: SCP rendered files to VM scratch dir
+        env:
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          REMOTE="deploy@$VM_IP"
+          # mktemp on the VM (writable by deploy). Persist path for next step.
+          # mktemp prefix MUST start with `${PROJECT_NAME_LOWER}-deploy.` so the
+          # trailing `sudo rm -rf` matches the sudoers allowlist entry
+          # `/usr/bin/rm -rf /tmp/${PROJECT_NAME_LOWER}-deploy.*` seeded by
+          # terraform/modules/${PROJECT_NAME_LOWER}-env/cloud-init.yaml.
+          REMOTE_SCRATCH=$(ssh -i ~/.ssh/staging "$REMOTE" 'd=$(mktemp -d /tmp/${PROJECT_NAME_LOWER}-deploy.XXXXXX); echo "$d"')
+          echo "REMOTE_SCRATCH=$REMOTE_SCRATCH" >> "$GITHUB_ENV"
+          scp -i ~/.ssh/staging /tmp/api.secrets.json      "$REMOTE:$REMOTE_SCRATCH/api.secrets.json"
+          scp -i ~/.ssh/staging /tmp/migrator.secrets.json "$REMOTE:$REMOTE_SCRATCH/migrator.secrets.json"
+          scp -i ~/.ssh/staging /tmp/openiddict.pfx        "$REMOTE:$REMOTE_SCRATCH/openiddict.pfx"
+          scp -i ~/.ssh/staging /tmp/.env.staging          "$REMOTE:$REMOTE_SCRATCH/.env.staging"
+          scp -i ~/.ssh/staging docker-compose.yml         "$REMOTE:$REMOTE_SCRATCH/docker-compose.yml"
+          scp -i ~/.ssh/staging docker-compose.staging.yml "$REMOTE:$REMOTE_SCRATCH/docker-compose.staging.yml"
+          scp -i ~/.ssh/staging Caddyfile.staging          "$REMOTE:$REMOTE_SCRATCH/Caddyfile.staging"
+
+      - name: Atomic install to /etc/${PROJECT_NAME_LOWER} + /srv/${PROJECT_NAME_LOWER}
+        env:
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          REMOTE="deploy@$VM_IP"
+          # Quoted `<<'REMOTE'` suppresses local expansion — the body ships
+          # verbatim to remote bash. REMOTE_SCRATCH arrives as $1 via the
+          # explicit positional arg to `bash -s`. Avoids the "single-quoted
+          # heredoc inside ssh double-quotes" footgun.
+          ssh -i ~/.ssh/staging "$REMOTE" bash -s "$REMOTE_SCRATCH" <<'REMOTE'
+          set -euo pipefail
+          scratch="$1"
+          # /srv/${PROJECT_NAME_LOWER} is the compose working dir on the VM
+          sudo install -d -o deploy -g deploy -m 0755 /srv/${PROJECT_NAME_LOWER}
+          # Container-mounted secrets: owned 10001:10001 (the in-container
+          # user/group inside both api and migrator images — see
+          # src/Dockerfile.dotnet (`api` and `migrator` targets), both
+          # `USER app` with `adduser -u 10001 -G app`). Numeric ownership
+          # matches across host↔container regardless of whether the host has
+          # a matching user. Mode 0640 keeps the file unreadable to other
+          # users; access is also bounded by the parent dir's 0750
+          # root:deploy so non-deploy host users can't even traverse to
+          # reach it. `.env.staging` stays root:deploy because docker
+          # compose reads it as the docker daemon (root), not inside any
+          # container.
+          sudo install -m 0640 -o 10001 -g 10001 "$scratch/api.secrets.json"      /etc/${PROJECT_NAME_LOWER}/api/appsettings.secrets.json
+          sudo install -m 0640 -o 10001 -g 10001 "$scratch/migrator.secrets.json" /etc/${PROJECT_NAME_LOWER}/migrator/appsettings.secrets.json
+          sudo install -m 0640 -o 10001 -g 10001 "$scratch/openiddict.pfx"        /etc/${PROJECT_NAME_LOWER}/openiddict.pfx
+          sudo install -m 0640 -o root  -g deploy "$scratch/.env.staging"         /etc/${PROJECT_NAME_LOWER}/.env.staging
+          # Compose files: 0644 deploy:deploy (deploy needs read access)
+          sudo install -m 0644 -o deploy -g deploy "$scratch/docker-compose.yml"         /srv/${PROJECT_NAME_LOWER}/docker-compose.yml
+          sudo install -m 0644 -o deploy -g deploy "$scratch/docker-compose.staging.yml" /srv/${PROJECT_NAME_LOWER}/docker-compose.staging.yml
+          sudo install -m 0644 -o deploy -g deploy "$scratch/Caddyfile.staging"          /srv/${PROJECT_NAME_LOWER}/Caddyfile.staging
+          # Scratch cleanup (sudoers permits `rm /tmp/${PROJECT_NAME_LOWER}-deploy.*`)
+          sudo rm -rf "$scratch"
+          REMOTE
+
+      - name: GHCR login on VM
+        env:
+          VM_IP:      ${{ vars.STAGING_VM_IP }}
+          # GITHUB_TOKEN is auto-issued per workflow run, scoped to this
+          # repo's packages (via the `permissions: packages: read` block),
+          # and revoked when the run ends. No per-operator PAT to manage,
+          # no rotation, works for any operator who can trigger the
+          # workflow. For installation tokens, the `-u` value is essentially
+          # ignored as long as it's a non-empty string — `repository_owner`
+          # works (this is the case where the org name IS accepted, unlike
+          # user PATs which require the owner's username).
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER:  ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          REMOTE="deploy@$VM_IP"
+          # Pipe token through stdin — never appears in argv on the remote
+          # `ps` tree. The GHCR_USER is server-validated, but quoted for
+          # belt + suspenders.
+          printf '%s' "$GHCR_TOKEN" | ssh -i ~/.ssh/staging "$REMOTE" \
+            "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+
+      - name: Pull all images
+        env:
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/staging "deploy@$VM_IP" \
+            'cd /srv/${PROJECT_NAME_LOWER} && docker compose -f docker-compose.yml -f docker-compose.staging.yml --env-file /etc/${PROJECT_NAME_LOWER}/.env.staging pull api web migrator'
+
+      - name: Run migrator (one-shot, blocking)
+        if: ${{ ! inputs.skip_migrator }}
+        env:
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          # Explicit `if !` trap. Non-zero exit aborts BEFORE the api/web
+          # restart step — old containers keep serving traffic.
+          if ! ssh -i ~/.ssh/staging "deploy@$VM_IP" \
+              'cd /srv/${PROJECT_NAME_LOWER} && docker compose -f docker-compose.yml -f docker-compose.staging.yml --env-file /etc/${PROJECT_NAME_LOWER}/.env.staging --profile migrate run --rm migrator'; then
+            echo "::error::Migrator failed (non-zero exit). Aborting before api/web restart."
+            echo "::error::Old api/web containers continue serving traffic. SSH in and inspect 'docker logs ${PROJECT_NAME_LOWER}-migrator'."
+            exit 1
+          fi
+
+      - name: Restart api + web + caddy + db
+        env:
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          # `db` is intentionally in the list — Compose's `up -d` is
+          # idempotent (no restart if healthy), but if Postgres got
+          # OOM-killed and didn't auto-recover this brings it back.
+          ssh -i ~/.ssh/staging "deploy@$VM_IP" \
+            'cd /srv/${PROJECT_NAME_LOWER} && docker compose -f docker-compose.yml -f docker-compose.staging.yml --env-file /etc/${PROJECT_NAME_LOWER}/.env.staging up -d --pull=always db api web caddy'
+
+      - name: Health probe (60s budget)
+        env:
+          API_HOSTNAME: ${{ vars.STAGING_API_HOSTNAME }}
+          WEB_HOSTNAME: ${{ vars.STAGING_WEB_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          API_URL="https://${API_HOSTNAME}/health-live"
+          WEB_URL="https://${WEB_HOSTNAME}/"
+          api=000
+          web=000
+          for i in $(seq 1 30); do
+            # -k accepts LE-staging / tls-internal cert (browser-distrusted
+            # but cryptographically valid). --max-time keeps each probe short.
+            api=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$API_URL" || echo 000)
+            web=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$WEB_URL" || echo 000)
+            if [[ "$api" == "200" && "$web" == "200" ]]; then
+              echo "::notice::Healthy after $((i*2))s (api=$api, web=$web)"
+              exit 0
+            fi
+            echo "Attempt $i/30: api=$api web=$web - retrying in 2s"
+            sleep 2
+          done
+          echo "::error::Health probes failed after 60s. api=$api web=$web."
+          echo "::error::Triage: ssh in, run 'docker compose -f /srv/${PROJECT_NAME_LOWER}/docker-compose.yml -f /srv/${PROJECT_NAME_LOWER}/docker-compose.staging.yml logs --tail=200'."
+          exit 1
+
+      - name: Record last-known-good (build on runner, scp, sudo install)
+        if: success()
+        env:
+          API_TAG:       ${{ steps.tags.outputs.API_VERSION }}
+          WEB_TAG:       ${{ steps.tags.outputs.WEB_VERSION }}
+          MIG_TAG:       ${{ steps.tags.outputs.MIGRATOR_VERSION }}
+          SOURCE_SHA:    ${{ steps.tags.outputs.SOURCE_SHA }}
+          DEPLOY_RUN_ID: ${{ github.run_id }}
+          VM_IP:         ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          REMOTE="deploy@$VM_IP"
+          DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Build LOCALLY on the runner so $API_TAG etc. expand in
+          # deterministic bash. NEVER use `ssh ... 'cat > f <<EOF'` patterns
+          # — bash variable expansion behaves differently across the SSH
+          # boundary.
+          LKG_LOCAL=$(mktemp -d)
+          printf 'API_VERSION=%s\n'      "$API_TAG" > "$LKG_LOCAL/last-known-good-api.env"
+          printf 'WEB_VERSION=%s\n'      "$WEB_TAG" > "$LKG_LOCAL/last-known-good-web.env"
+          printf 'MIGRATOR_VERSION=%s\n' "$MIG_TAG" > "$LKG_LOCAL/last-known-good-migrator.env"
+          {
+            printf 'API_VERSION=%s\n'      "$API_TAG"
+            printf 'WEB_VERSION=%s\n'      "$WEB_TAG"
+            printf 'MIGRATOR_VERSION=%s\n' "$MIG_TAG"
+            printf 'DEPLOY_RUN_ID=%s\n'    "$DEPLOY_RUN_ID"
+            printf 'DEPLOYED_AT=%s\n'      "$DEPLOYED_AT"
+            printf 'SOURCE_SHA=%s\n'       "$SOURCE_SHA"
+          } > "$LKG_LOCAL/current-deploy.env"
+          # SCP to scratch, then atomic install. The rollback workflow
+          # reads these.
+          # mktemp prefix MUST match the sudoers allowlist entry
+          # `/usr/bin/rm -rf /tmp/${PROJECT_NAME_LOWER}-deploy.*` —
+          # otherwise the trailing `sudo rm -rf` fails with "password
+          # required" and `set -euo pipefail` fails the whole step.
+          REMOTE_LKG=$(ssh -i ~/.ssh/staging "$REMOTE" 'd=$(mktemp -d /tmp/${PROJECT_NAME_LOWER}-deploy.XXXXXX); echo "$d"')
+          scp -i ~/.ssh/staging "$LKG_LOCAL"/*.env "$REMOTE:$REMOTE_LKG/"
+          ssh -i ~/.ssh/staging "$REMOTE" bash -s "$REMOTE_LKG" <<'REMOTE'
+          set -euo pipefail
+          scratch="$1"
+          for f in last-known-good-api.env last-known-good-web.env last-known-good-migrator.env current-deploy.env; do
+            sudo install -m 0644 -o root -g deploy "$scratch/$f" "/etc/${PROJECT_NAME_LOWER}/$f"
+          done
+          sudo rm -rf "$scratch"
+          REMOTE
+          rm -rf "$LKG_LOCAL"
+
+      - name: Cleanup remote scratch on failure
+        if: failure() && env.REMOTE_SCRATCH != ''
+        env:
+          VM_IP: ${{ vars.STAGING_VM_IP }}
+        run: |
+          set -euo pipefail
+          # Best-effort cleanup if the install step never ran. The sudoers
+          # `rm /tmp/${PROJECT_NAME_LOWER}-deploy.*` allowlist covers this
+          # path. Ignore failures.
+          ssh -i ~/.ssh/staging "deploy@$VM_IP" "sudo rm -rf '$REMOTE_SCRATCH'" || true
+
+      - name: Discord notify failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ github.event.workflow_run.head_sha || inputs.commit_sha || github.sha }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          FAILED_JOB:          ${{ github.job }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          payload=$(jq -n \
+            --arg title "Staging deploy failed" \
+            --arg env "staging" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            --arg failed_job "$FAILED_JOB" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 15158332,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md},
+                  {name: "Failed job",  value: $failed_job, inline: true}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: Write step summary
+        if: always()
+        env:
+          API_TAG:    ${{ steps.tags.outputs.API_VERSION }}
+          WEB_TAG:    ${{ steps.tags.outputs.WEB_VERSION }}
+          MIG_TAG:    ${{ steps.tags.outputs.MIGRATOR_VERSION }}
+          SOURCE_SHA: ${{ steps.tags.outputs.SOURCE_SHA }}
+          WEB_HOST:   ${{ vars.STAGING_WEB_HOSTNAME }}
+          STATUS:     ${{ job.status }}
+        run: |
+          {
+            echo "## Staging Deploy"
+            echo ""
+            echo "**Status:** ${STATUS}"
+            echo "**Source SHA:** \`${SOURCE_SHA}\`"
+            echo ""
+            echo "| Service | Tag |"
+            echo "|---|---|"
+            echo "| API | \`${API_TAG}\` |"
+            echo "| Web | \`${WEB_TAG}\` |"
+            echo "| Migrator | \`${MIG_TAG}\` |"
+            echo ""
+            echo "Visit: https://${WEB_HOST}/  (accept LE-staging cert once per browser per origin)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Discord notify success
+        if: success()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_NAME:          ${{ github.event_name }}
+          ACTOR:               ${{ github.actor }}
+          REPO:                ${{ github.repository }}
+          COMMIT_SHA:          ${{ steps.tags.outputs.SOURCE_SHA }}
+          RUN_ID:              ${{ github.run_id }}
+          RUN_NUMBER:          ${{ github.run_number }}
+          API_HOSTNAME:        ${{ vars.STAGING_API_HOSTNAME }}
+          WEB_HOSTNAME:        ${{ vars.STAGING_WEB_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL not set — skipping Discord notification"
+            exit 0
+          fi
+          SHA_SHORT="${COMMIT_SHA:0:7}"
+          SPA_URL="https://${WEB_HOSTNAME}/"
+          API_URL="https://${API_HOSTNAME}/health-live"
+          payload=$(jq -n \
+            --arg title "Staging deploy succeeded" \
+            --arg env "staging" \
+            --arg trigger "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg commit_md "[\`${SHA_SHORT}\`](https://github.com/${REPO}/commit/${COMMIT_SHA})" \
+            --arg run_md "[#${RUN_NUMBER}](https://github.com/${REPO}/actions/runs/${RUN_ID})" \
+            --arg spa_url "$SPA_URL" \
+            --arg api_url "$API_URL" \
+            '{
+              embeds: [{
+                title: $title,
+                color: 3066993,
+                fields: [
+                  {name: "Environment", value: $env, inline: true},
+                  {name: "Trigger",     value: $trigger, inline: true},
+                  {name: "Actor",       value: $actor, inline: true},
+                  {name: "Commit",      value: $commit_md},
+                  {name: "Run",         value: $run_md},
+                  {name: "SPA URL",     value: $spa_url},
+                  {name: "API URL",     value: $api_url}
+                ],
+                timestamp: now | todate
+              }]
+            }')
+          curl -sS --max-time 10 --retry 2 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true

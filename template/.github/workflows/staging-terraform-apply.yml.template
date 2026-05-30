@@ -1,0 +1,56 @@
+# .github/workflows/staging-terraform-apply.yml — staging wrapper around
+# the reusable `_terraform-apply.yml` template.
+#
+# Thin per-env wrapper: owns the `workflow_dispatch` trigger surface and
+# forwards staging's inputs (env name, working dir, HCP workspace,
+# concurrency group, deploy SSH key) plus the operator-typed `confirm` /
+# `commit_sha` inputs to the reusable template. The actual apply logic —
+# confirm-string gate, terraform init/apply, cloud-init SSH wait, Discord
+# embeds — lives in `_terraform-apply.yml`.
+#
+# Concurrency group `${PROJECT_NAME_LOWER}-staging-deploy` is shared with
+# `staging-deploy.yml`, `staging-rollback.yml`, and
+# `staging-terraform-destroy.yml` so apply, deploy, destroy, and rollback
+# queue serially and never race.
+#
+# Per-env duplication: to clone this wrapper for a new env (e.g.,
+# production), use:
+#   scripts/new-terraform-env.sh production
+# which copies this file → production-terraform-apply.yml and
+# sed-substitutes `staging` → `production` (env_name, tf_working_dir,
+# concurrency_group, HCP workspace, secret names).
+# See docs/scaffold-runbook.md (Adding a new environment) for the full
+# procedure.
+
+name: Staging Terraform Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type: yes I have read the plan"
+        required: true
+        type: string
+      commit_sha:
+        description: "Optional: commit SHA to apply (default: latest main)"
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  apply:
+    uses: ./.github/workflows/_terraform-apply.yml
+    with:
+      env_name: staging
+      tf_working_dir: terraform/staging
+      hcp_workspace: ${PROJECT_NAME_LOWER}-staging
+      concurrency_group: ${PROJECT_NAME_LOWER}-staging-deploy
+      confirm: ${{ inputs.confirm }}
+      commit_sha: ${{ inputs.commit_sha }}
+      ssh_allowed_cidrs: ${{ vars.STAGING_SSH_ALLOWED_CIDRS }}
+      operator_ssh_pubkeys: ${{ vars.STAGING_OPERATOR_SSH_PUBKEYS }}
+    secrets:
+      deploy_ssh_key:      ${{ secrets.STAGING_DEPLOY_SSH_KEY }}
+      HCLOUD_TOKEN:        ${{ secrets.HCLOUD_TOKEN }}
+      HCP_TF_TOKEN:        ${{ secrets.HCP_TF_TOKEN }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
