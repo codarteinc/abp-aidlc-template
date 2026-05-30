@@ -1,0 +1,169 @@
+# syntax=docker/dockerfile:1.7
+#
+# Shared .NET Dockerfile for ${PROJECT_NAME}.HttpApi.Host (target: api) and
+# ${PROJECT_NAME}.DbMigrator (target: migrator). One builder stage publishes
+# both projects; two thin runtime stages each take their slice.
+#
+# Build with one of:
+#   docker build -f src/Dockerfile.dotnet --target api      -t ${PROJECT_NAME_LOWER}-api:<tag> .
+#   docker build -f src/Dockerfile.dotnet --target migrator -t ${PROJECT_NAME_LOWER}-dbmigrator:<tag> .
+#
+# Context: repository root.
+
+# ---------------------------------------------------------------------------
+# build stage — restore + publish for BOTH projects
+# ---------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/sdk:10.0-alpine@sha256:5c559aa5d99337e400d39ab4fa1f6979d126c29b20939d53658ed38300571e74 AS build
+WORKDIR /src
+
+# COPY ordering matters for BuildKit cache:
+# 1. csproj + props + global.json + NuGet.Config first → restore-cacheable
+# 2. src/ last → publish layer invalidates only on actual code changes
+#
+# We do NOT copy ${PROJECT_NAME}.slnx or any test csproj — solution-wide
+# restore would require test csprojs on disk, busting the publish layer on
+# every test edit. Instead, restore per-project (twice) — but BuildKit
+# deduplicates package downloads via the shared NuGet cache mount below.
+COPY common.props global.json NuGet.Config ./
+COPY src/ ./src/
+
+RUN --mount=type=cache,target=/root/.nuget/packages,sharing=locked \
+    dotnet restore src/${PROJECT_NAME}.HttpApi.Host/${PROJECT_NAME}.HttpApi.Host.csproj -r linux-musl-x64 && \
+    dotnet restore src/${PROJECT_NAME}.DbMigrator/${PROJECT_NAME}.DbMigrator.csproj -r linux-musl-x64
+
+# Publish API to /publish/api
+RUN --mount=type=cache,target=/root/.nuget/packages,sharing=locked \
+    dotnet publish src/${PROJECT_NAME}.HttpApi.Host/${PROJECT_NAME}.HttpApi.Host.csproj \
+    -c Release \
+    --no-restore \
+    -r linux-musl-x64 \
+    --self-contained false \
+    -o /publish/api \
+    /p:UseAppHost=false
+
+# Publish DbMigrator to /publish/migrator — the shared transitive projects
+# (Domain.Shared, Domain, App.Contracts, EF Core) are already compiled in the
+# obj/ cache from the API publish above. dotnet publish detects the up-to-date
+# outputs and skips re-compilation of those projects.
+RUN --mount=type=cache,target=/root/.nuget/packages,sharing=locked \
+    dotnet publish src/${PROJECT_NAME}.DbMigrator/${PROJECT_NAME}.DbMigrator.csproj \
+    -c Release \
+    --no-restore \
+    -r linux-musl-x64 \
+    --self-contained false \
+    -o /publish/migrator \
+    /p:UseAppHost=false
+
+# ---------------------------------------------------------------------------
+# abp install-libs stage — only needed for the API image
+# ---------------------------------------------------------------------------
+FROM build AS libs
+RUN apk add --no-cache nodejs npm \
+ && dotnet tool install -g Volo.Abp.Studio.Cli --version 3.0.2
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.dotnet/tools"
+# First invocation triggers extension-pack download and self-restart
+# (which detaches in a containerized non-TTY shell), so it does NOT
+# actually populate wwwroot/libs. The warm-up invocation below is
+# allowed to "succeed" without producing libs — its only job is to
+# materialise the extension pack on disk so subsequent invocations
+# can run install-libs synchronously against it.
+RUN cd src/${PROJECT_NAME}.HttpApi.Host && (abp install-libs || true)
+# Real install-libs run, with a retry loop as a safety net. Yarn's
+# registry occasionally returns corrupt or truncated tarballs; the
+# BuildKit --mount=type=cache mounts give a persistent yarn package
+# cache. sharing=locked serialises concurrent builds for correctness.
+# Wipe wwwroot/libs before each attempt so the post-install non-empty
+# check reflects ONLY the current attempt's output.
+RUN --mount=type=cache,target=/usr/local/share/.cache/yarn,sharing=locked \
+    --mount=type=cache,target=/root/.cache/yarn,sharing=locked \
+    cd src/${PROJECT_NAME}.HttpApi.Host \
+ && for attempt in 1 2 3; do \
+        echo ">>> abp install-libs attempt ${attempt}/3" >&2; \
+        rm -rf wwwroot/libs; \
+        if abp install-libs && [ -d wwwroot/libs ] && [ -n "$(ls -A wwwroot/libs 2>/dev/null)" ]; then \
+            echo ">>> abp install-libs attempt ${attempt}/3 succeeded" >&2; \
+            break; \
+        fi; \
+        if [ "${attempt}" = "3" ]; then \
+            echo ">>> abp install-libs failed after 3 attempts (purge yarn cache mount via 'docker buildx prune --filter type=exec.cachemount' if blob corruption suspected)" >&2; \
+            exit 1; \
+        fi; \
+        echo ">>> abp install-libs attempt ${attempt}/3 failed; retrying" >&2; \
+    done
+
+# ---------------------------------------------------------------------------
+# API runtime stage — aspnet base, copies /publish/api + libs
+# ---------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine@sha256:1e37a8236c558ae31bd6bc8144e38e6036b73cf1b0616fe56d79e60babb9d93b AS api
+
+# Runtime packages:
+#   - curl       — needed for HEALTHCHECK (neither curl nor wget ship in
+#                  aspnet:10.0-alpine).
+#   - icu-libs   — ICU shared libs (needed to leave globalization-invariant
+#                  mode).
+#   - icu-data-full — locale data.
+#   - tzdata     — IANA tz database.
+RUN apk add --no-cache curl icu-libs icu-data-full tzdata
+
+# Non-root system user/group. UID/GID 10001 is load-bearing — the staging
+# deploy workflow installs /etc/${PROJECT_NAME_LOWER}/{api,migrator}/appsettings.secrets.json
+# and /etc/${PROJECT_NAME_LOWER}/openiddict.pfx owned 10001:10001 mode 0640.
+# Changing the uid here breaks the staging deploy.
+RUN addgroup -S -g 10001 ${PROJECT_NAME_LOWER} \
+ && adduser  -S -u 10001 -G ${PROJECT_NAME_LOWER} ${PROJECT_NAME_LOWER}
+
+WORKDIR /app
+COPY --from=build --chown=${PROJECT_NAME_LOWER}:${PROJECT_NAME_LOWER} /publish/api ./
+COPY --from=libs --chown=${PROJECT_NAME_LOWER}:${PROJECT_NAME_LOWER} /src/src/${PROJECT_NAME}.HttpApi.Host/wwwroot/libs ./wwwroot/libs
+
+# ASPNETCORE_ENVIRONMENT is intentionally NOT baked into the image —
+# compose / k8s MUST supply it. Baking a default here would silently
+# mask a missing-env-var misconfiguration.
+ENV ASPNETCORE_URLS=http://+:8080 \
+    DOTNET_RUNNING_IN_CONTAINER=true \
+    DOTNET_USE_POLLING_FILE_WATCHER=true \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+
+USER ${PROJECT_NAME_LOWER}
+EXPOSE 8080
+
+# Liveness check hits the anonymous /health-live endpoint (status 200
+# if Kestrel can route). /health-ready is auth-gated and unsuitable
+# for an unauthenticated docker HEALTHCHECK probe.
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:8080/health-live || exit 1
+
+ENTRYPOINT ["dotnet", "${PROJECT_NAME}.HttpApi.Host.dll"]
+
+# ---------------------------------------------------------------------------
+# DbMigrator runtime stage — aspnet base (needs AspNetCore framework),
+# copies /publish/migrator.
+# ---------------------------------------------------------------------------
+# The migrator is a console app, but its dependency chain
+# (Serilog.AspNetCore via ProjectReference → ABP modules) pulls in
+# Microsoft.AspNetCore.App as a framework reference. The runtime: base
+# lacks that framework and the app fails at startup with:
+#   "Framework: 'Microsoft.AspNetCore.App' ... No frameworks were found."
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine@sha256:1e37a8236c558ae31bd6bc8144e38e6036b73cf1b0616fe56d79e60babb9d93b AS migrator
+
+# Runtime packages — same globalization stack as the API image so
+# configured cultures resolve at startup. No curl (no HEALTHCHECK).
+RUN apk add --no-cache icu-libs icu-data-full tzdata
+
+# Same uid/gid contract as the API runtime — see comment in the api stage.
+RUN addgroup -S -g 10001 ${PROJECT_NAME_LOWER} \
+ && adduser  -S -u 10001 -G ${PROJECT_NAME_LOWER} ${PROJECT_NAME_LOWER}
+
+WORKDIR /app
+COPY --from=build --chown=${PROJECT_NAME_LOWER}:${PROJECT_NAME_LOWER} /publish/migrator ./
+
+ENV DOTNET_RUNNING_IN_CONTAINER=true \
+    DOTNET_USE_POLLING_FILE_WATCHER=true \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+
+USER ${PROJECT_NAME_LOWER}
+
+# No EXPOSE — this image does not bind any port.
+# No HEALTHCHECK — one-shot Job; orchestrator reads the exit code.
+
+ENTRYPOINT ["dotnet", "${PROJECT_NAME}.DbMigrator.dll"]

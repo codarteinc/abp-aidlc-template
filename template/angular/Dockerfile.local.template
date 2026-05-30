@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7
+#
+# Angular SPA — LOCAL development image (nginx-only).
+#
+# Stripped-down variant that expects the operator to have already run
+# `yarn build:prod` on the host so a `dist/${PROJECT_NAME}/browser/`
+# directory exists in the build context. Used when iterating on the SPA
+# bundle while leaving the rest of the compose stack stable — avoids
+# the ~90s yarn install + ng build cold path on every `docker compose
+# up --build`.
+#
+# Build context: ./angular. Build with:
+#   yarn build:prod
+#   docker build -f angular/Dockerfile.local -t ${PROJECT_NAME_LOWER}-web:local ./angular
+FROM nginx:alpine@sha256:dc48b7a872a79fb541ba5081d320b11b549231bc63ba465a7495afaa7d2ebcb8
+COPY dist/${PROJECT_NAME}/browser /usr/share/nginx/html
+COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+COPY dynamic-env.json.template /etc/${PROJECT_NAME_LOWER}/dynamic-env.json.template
+COPY docker-entrypoint.d/25-envsubst-dynamic-env.sh /docker-entrypoint.d/25-envsubst-dynamic-env.sh
+RUN chmod +x /docker-entrypoint.d/25-envsubst-dynamic-env.sh
+ENV NGINX_ENVSUBST_FILTER='^APP_'
+ENV APP_SENTRY_INGEST_ORIGIN=""
+RUN chown -R nginx:nginx /var/cache/nginx /usr/share/nginx/html /run /etc/nginx/conf.d
+USER nginx
+EXPOSE 8080

@@ -1,0 +1,55 @@
+# Caddyfile.dev — HTTPS-via-Caddy-internal-CA for local dev.
+#
+# Loaded by docker-compose.dev.yml. Dev runs on localhost with no
+# PUBLIC certificate authority, so we use Caddy's built-in internal
+# CA (`tls internal`) to mint self-signed certs that the API and SPA
+# see as a normal HTTPS upstream.
+#
+# Plain-HTTP requests on :80 get a permanent redirect to :443 so
+# `curl http://localhost/` still resolves (with -L).
+#
+# Operator note: `curl -k` is needed to bypass the self-signed cert
+# locally. A developer who wants the cert trusted can run:
+#   docker compose exec caddy caddy trust
+# (writes the CA root to /data/caddy/pki/authorities/local/root.crt)
+# and import that file into their browser / OS trust store.
+
+{
+	# Disable Let's Encrypt outbound — we use the internal CA only.
+	# (auto_https stays ON globally for the :80 → :443 redirect, but
+	# `tls internal` per-site keeps cert provisioning local.)
+	auto_https disable_redirects
+	# Bind the admin endpoint to loopback only — defense-in-depth.
+	admin localhost:2019
+}
+
+# Public API endpoint (HTTPS via Caddy internal CA in dev)
+{$APP_API_HOSTNAME} {
+	tls internal
+	encode gzip
+	reverse_proxy api:8080 {
+		health_uri /health-live
+		health_interval 10s
+		health_timeout 3s
+	}
+}
+
+# Public SPA endpoint (HTTPS via Caddy internal CA in dev)
+{$APP_WEB_HOSTNAME} {
+	tls internal
+	encode gzip
+	reverse_proxy web:8080 {
+		health_uri /
+		health_interval 10s
+		health_timeout 3s
+	}
+}
+
+# Plain-HTTP companions on :80 that just 308 to the HTTPS site.
+http://{$APP_WEB_HOSTNAME} {
+	redir https://{$APP_WEB_HOSTNAME}{uri} 308
+}
+
+http://{$APP_API_HOSTNAME} {
+	redir https://{$APP_API_HOSTNAME}{uri} 308
+}

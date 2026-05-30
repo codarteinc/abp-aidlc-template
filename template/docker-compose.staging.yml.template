@@ -1,0 +1,77 @@
+# docker-compose.staging.yml — staging overlay, EXPLICIT `-f`.
+#
+# Run shape on the VM:
+#   docker compose -f docker-compose.yml -f docker-compose.staging.yml \
+#                  --profile migrate run --rm migrator
+#   docker compose -f docker-compose.yml -f docker-compose.staging.yml \
+#                  up -d --pull=always api web caddy db
+#
+# What staging does differently vs. base:
+#   - Pulls all app images from GHCR (no local build context).
+#   - Restarts all long-running services automatically.
+#   - Postgres uses a bind-mount under /var/lib/${PROJECT_NAME_LOWER}/db for backups.
+#   - Secrets bind-mounted from /etc/${PROJECT_NAME_LOWER}/ (operator-managed, 0640).
+#   - Caddy mounts Caddyfile.staging (auto-HTTPS via Let's Encrypt).
+
+services:
+  db:
+    # Intentionally NO host port — only the project network sees Postgres.
+    restart: always
+    volumes:
+      # Override the named volume from the base file with a host bind so
+      # operators can rsync /var/lib/${PROJECT_NAME_LOWER}/db without `docker run`.
+      - /var/lib/${PROJECT_NAME_LOWER}/db:/var/lib/postgresql/data
+
+  migrator:
+    image: ghcr.io/${GITHUB_OWNER}/${PROJECT_NAME_LOWER}-dbmigrator:${MIGRATOR_VERSION}
+    pull_policy: always
+    env_file:
+      # `required: false` keeps `docker compose config` parseable on a
+      # dev box without /etc/${PROJECT_NAME_LOWER}. On the VM, the deploy
+      # workflow scp+installs this file BEFORE any compose action, so the
+      # file is always present at runtime.
+      - path: /etc/${PROJECT_NAME_LOWER}/.env.staging
+        required: false
+    environment:
+      # OpenIddict client seed: the SPA client's RedirectUris +
+      # PostLogoutRedirectUris are seeded from this key on every
+      # migrator run. Without this override, the migrator falls back to
+      # the compiled-in dev redirect — which means the staging URL
+      # isn't in the allow-list and OIDC fails.
+      OpenIddict__Applications__${PROJECT_NAME}_App__RootUrl: ${WEB_PUBLIC_URL}
+    volumes:
+      - /etc/${PROJECT_NAME_LOWER}/migrator/appsettings.secrets.json:/app/appsettings.secrets.json:ro
+
+  api:
+    image: ghcr.io/${GITHUB_OWNER}/${PROJECT_NAME_LOWER}-api:${API_VERSION}
+    pull_policy: always
+    restart: always
+    env_file:
+      - path: /etc/${PROJECT_NAME_LOWER}/.env.staging
+        required: false
+    environment:
+      # Auth-gated by default; constrained-scrape (k8s NetworkPolicy or
+      # LB IP allowlist) belongs in the observability-stack future intent.
+      App__Metrics__Auth: "true"
+      # Cookie cross-origin (SPA + API on different hosts behind Caddy).
+      # SameSite=None requires Secure=true.
+      App__Cookies__SameSite: "None"
+      App__Cookies__Secure: "true"
+    volumes:
+      - /etc/${PROJECT_NAME_LOWER}/api/appsettings.secrets.json:/app/appsettings.secrets.json:ro
+      - /etc/${PROJECT_NAME_LOWER}/openiddict.pfx:/app/openiddict.pfx:ro
+
+  web:
+    image: ghcr.io/${GITHUB_OWNER}/${PROJECT_NAME_LOWER}-web:${WEB_VERSION}
+    pull_policy: always
+    restart: always
+    env_file:
+      - path: /etc/${PROJECT_NAME_LOWER}/.env.staging
+        required: false
+
+  caddy:
+    restart: always
+    volumes:
+      - ./Caddyfile.staging:/etc/caddy/Caddyfile:ro
+    # Caddyfile.staging lets Caddy's default auto_https behavior
+    # provision Let's Encrypt certs for the APP_*_HOSTNAME values.

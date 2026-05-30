@@ -1,0 +1,111 @@
+# syntax=docker/dockerfile:1.7
+#
+# ${PROJECT_NAME}.HttpApi.Host — LOCAL DEVELOPMENT build.
+#
+# This Dockerfile is for fast inner-loop iteration on a developer
+# workstation. It mints an ephemeral OpenIddict dev signing cert
+# inside the image so the host can boot without a host-mounted .pfx.
+#
+# Build context: repository root. Build with:
+#   docker build -f src/${PROJECT_NAME}.HttpApi.Host/Dockerfile.local \
+#     --build-arg OPENIDDICT_DEV_CERT_PASS="$OPENIDDICT_DEV_CERT_PASS" \
+#     -t ${PROJECT_NAME_LOWER}-api:local .
+#
+# DIVERGENCE FROM PRODUCTION
+#   Production API + DbMigrator images build from `src/Dockerfile.dotnet`
+#   (shared `build` stage). This local-dev variant is intentionally kept
+#   separate because it:
+#     - mints an ephemeral OpenIddict dev cert via `dotnet dev-certs`,
+#       which requires the Debian SDK base (the alpine SDK lacks the
+#       cert tool);
+#     - uses `--build-arg OPENIDDICT_DEV_CERT_PASS` for inner-loop
+#       ergonomics (production gets the cert from a host bind-mount via
+#       the staging deploy workflow);
+#     - has no need for the `libs` stage (dev compose bind-mounts
+#       `wwwroot/libs/` from the host instead of running
+#       `abp install-libs` inside the image).
+#   Local-dev quirks here intentionally do NOT propagate to the production
+#   shared Dockerfile.
+#
+# SECURITY NOTE
+#   The build-arg value WILL appear in this image's `docker history`
+#   output (Docker preserves interpolated RUN command lines as layer
+#   metadata). This is acceptable because:
+#     * the cert is `dotnet dev-certs https`-generated (untrusted by
+#       any external system),
+#     * the passphrase guards only the in-image .pfx — never a
+#       production secret,
+#     * this Dockerfile is NEVER used to build a CI / staging /
+#       production image (those use src/Dockerfile.dotnet).
+#   For a genuinely-secret build-time value, switch to BuildKit
+#   `RUN --mount=type=secret`. Not needed here.
+
+# Global build-arg — must be re-declared inside each stage that uses it.
+ARG OPENIDDICT_DEV_CERT_PASS
+
+# ---------------------------------------------------------------------------
+# build stage — uses the Debian-based SDK (ships dotnet-dev-certs
+# natively; alpine SDK works too but Debian is the canonical local
+# dev surface and matches what Visual Studio / Rider mount).
+# Pinned by digest like the production Dockerfile — supply-chain
+# attacks don't discriminate between dev and prod base images.
+# ---------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/sdk:10.0@sha256:dc8430e6024d454edadad1e160e1973be3cabbb7125998ef190d9e5c6adf7dbb AS build
+ARG OPENIDDICT_DEV_CERT_PASS
+WORKDIR /src
+
+# Fail fast with a developer-friendly error before doing any expensive
+# work if the build-arg was omitted. The `[ -n ... ]` test treats
+# unset and empty identically.
+RUN if [ -z "$OPENIDDICT_DEV_CERT_PASS" ]; then \
+      echo "ERROR: Set --build-arg OPENIDDICT_DEV_CERT_PASS=<your-dev-pass>" >&2; \
+      echo "       (any string; this is a local-only dev cert)" >&2; \
+      exit 1; \
+    fi
+
+# Mint a dev cert inside the image. The passphrase comes from the
+# build-arg — no literal in this committed file.
+RUN dotnet dev-certs https -v -ep openiddict.pfx -p "$OPENIDDICT_DEV_CERT_PASS" \
+ && chmod 644 openiddict.pfx
+
+COPY ${PROJECT_NAME}.slnx common.props global.json NuGet.Config ./
+COPY src/ ./src/
+
+# Pin restore + publish to the Alpine RID even though the build stage uses
+# the Debian SDK, so native dependencies match the musl-based runtime stage.
+RUN dotnet restore src/${PROJECT_NAME}.HttpApi.Host/${PROJECT_NAME}.HttpApi.Host.csproj -r linux-musl-x64
+RUN dotnet publish src/${PROJECT_NAME}.HttpApi.Host/${PROJECT_NAME}.HttpApi.Host.csproj \
+    -c Release --no-restore -r linux-musl-x64 --self-contained false \
+    -o /publish /p:UseAppHost=false
+
+# ---------------------------------------------------------------------------
+# runtime stage — same alpine ASP.NET base + non-root user as the
+# production Dockerfile so the local image's runtime behaviour
+# matches what CI / staging will build.
+# ---------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine@sha256:1e37a8236c558ae31bd6bc8144e38e6036b73cf1b0616fe56d79e60babb9d93b AS final
+
+# Match the production runtime stack: curl for HEALTHCHECK +
+# ICU/tzdata to leave globalization-invariant mode.
+RUN apk add --no-cache curl icu-libs icu-data-full tzdata
+
+RUN addgroup -S -g 10001 ${PROJECT_NAME_LOWER} \
+ && adduser  -S -u 10001 -G ${PROJECT_NAME_LOWER} ${PROJECT_NAME_LOWER}
+
+WORKDIR /app
+COPY --from=build --chown=${PROJECT_NAME_LOWER}:${PROJECT_NAME_LOWER} /publish ./
+COPY --from=build --chown=${PROJECT_NAME_LOWER}:${PROJECT_NAME_LOWER} /src/openiddict.pfx /app/openiddict.pfx
+
+ENV ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_ENVIRONMENT=Development \
+    DOTNET_RUNNING_IN_CONTAINER=true \
+    DOTNET_USE_POLLING_FILE_WATCHER=true \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+
+USER ${PROJECT_NAME_LOWER}
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:8080/health-live || exit 1
+
+ENTRYPOINT ["dotnet", "${PROJECT_NAME}.HttpApi.Host.dll"]

@@ -1,0 +1,78 @@
+#!/bin/sh
+#
+# Render /etc/${PROJECT_NAME_LOWER}/dynamic-env.json.template
+# -> /usr/share/nginx/html/dynamic-env.json at container start.
+#
+# Substitutes only env vars matching ${NGINX_ENVSUBST_FILTER} (defaults
+# to '^APP_'). Mirrors the APP_*-only contract enforced by the built-in
+# nginx.conf template entrypoint (/docker-entrypoint.d/20-envsubst-on-
+# templates.sh), so any nginx-style $vars or other literals in the JSON
+# template pass through unchanged.
+#
+# Missing/unset APP_* env vars render as empty strings (envsubst default)
+# — NOT the literal `${APP_FOO}` token. That's the no-leak contract the
+# SPA depends on (an empty Sentry DSN must be a real empty string for
+# the no-op Sentry path).
+
+set -e
+
+ME=$(basename "$0")
+
+entrypoint_log() {
+    if [ -z "${NGINX_ENTRYPOINT_QUIET_LOGS:-}" ]; then
+        echo "$@"
+    fi
+}
+
+# Fail fast on missing required runtime URLs. Without this, unset vars
+# render as empty strings in dynamic-env.json and the SPA boots into a
+# broken state (OIDC redirect to "", API calls to "", etc.). Surfacing
+# the misconfiguration at container start (visible in `docker logs`) is
+# far easier to diagnose than a silent SPA bootstrap failure in the
+# browser.
+required="APP_BASE_URL APP_API_URL APP_OAUTH_ISSUER APP_OAUTH_REDIRECT"
+missing=""
+for var in $required; do
+    eval "val=\${$var:-}"
+    if [ -z "$val" ]; then
+        missing="$missing $var"
+    fi
+done
+if [ -n "$missing" ]; then
+    echo "$ME: ERROR: required runtime env vars missing/empty:$missing" >&2
+    echo "$ME: ERROR: the SPA cannot start without these." >&2
+    exit 1
+fi
+
+# Normalise boolean feature-flag env vars so the rendered JSON is always
+# valid (`"showSocialProof": ,` is a parse error). `:=` sets only when
+# the variable is unset OR empty; preserves explicit `true`/`false` set
+# by the operator.
+: "${APP_SHOW_SOCIAL_PROOF:=false}"
+: "${APP_SHOW_ACTIVITY_FEED:=false}"
+export APP_SHOW_SOCIAL_PROOF APP_SHOW_ACTIVITY_FEED
+
+template="/etc/${PROJECT_NAME_LOWER}/dynamic-env.json.template"
+output="/usr/share/nginx/html/dynamic-env.json"
+filter="${NGINX_ENVSUBST_FILTER:-^APP_}"
+
+if [ ! -f "$template" ]; then
+    entrypoint_log "$ME: no template at $template, skipping"
+    exit 0
+fi
+
+# Allowlist EVERY ${APP_*} placeholder that appears in the template,
+# regardless of whether it's currently set in the environment. This is
+# the no-leak contract: an unset APP_SENTRY_DSN must render as an empty
+# string (the no-op Sentry path), NOT the literal `${APP_SENTRY_DSN}`
+# token leaking through to the browser.
+template_vars=$(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "$template" | tr -d '${}' | awk -v re="$filter" '$0 ~ re { print }' | sort -u)
+defined_envs=""
+for var in $template_vars; do
+    defined_envs="$defined_envs \${$var}"
+done
+
+entrypoint_log "$ME: Running envsubst on $template to $output (filter=$filter, vars=$template_vars)"
+envsubst "$defined_envs" < "$template" > "$output"
+
+exit 0

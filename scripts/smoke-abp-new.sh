@@ -187,4 +187,76 @@ fi
 # Clean up so the smoke tmpdir trap doesn't carry crypto material around.
 rm -f "${project_root}/src/SmokeApp.HttpApi.Host/openiddict.pfx"
 
+# 6. Unit-06 docker-overlay assertions.
+echo "--- unit-06 docker-overlay assertions ---"
+
+# 6a. Compose files: structural shape via yq (always runs — yq is a hard
+# scaffold.sh preflight dep). If docker is on PATH, also run
+# `docker compose config` which catches YAML errors + missing-${VAR}
+# references that lack a `:?` fallback.
+for compose_f in docker-compose.yml docker-compose.dev.yml docker-compose.staging.yml; do
+    if [[ ! -f "${project_root}/${compose_f}" ]]; then
+        echo "FAIL: ${compose_f} missing from rendered tree" >&2
+        exit 1
+    fi
+done
+
+if command -v docker >/dev/null; then
+    if ! ( cd "$project_root" && \
+            APP_ENVIRONMENT=Development DB_PASSWORD=smoke API_PUBLIC_URL=https://api.localhost \
+            WEB_PUBLIC_URL=https://localhost APP_API_HOSTNAME=api.localhost \
+            APP_WEB_HOSTNAME=localhost \
+            docker compose -f docker-compose.yml -f docker-compose.dev.yml config > /dev/null 2>&1 ); then
+        echo "FAIL: base+dev compose config didn't parse" >&2
+        exit 1
+    fi
+    if ! ( cd "$project_root" && \
+            APP_ENVIRONMENT=Staging DB_PASSWORD=smoke API_VERSION=v1 WEB_VERSION=v1 \
+            MIGRATOR_VERSION=v1 API_PUBLIC_URL=https://api.example.com \
+            WEB_PUBLIC_URL=https://example.com APP_API_HOSTNAME=api.example.com \
+            APP_WEB_HOSTNAME=example.com APP_ACME_EMAIL=ops@example.com \
+            docker compose -f docker-compose.yml -f docker-compose.staging.yml config > /dev/null 2>&1 ); then
+        echo "FAIL: base+staging compose config didn't parse" >&2
+        exit 1
+    fi
+else
+    echo "SKIP: docker not on PATH; compose config parse skipped (yq structural shape covered the basics)"
+fi
+
+# 6b. nginx.conf.template carries all 6 security directives + getEnvConfig + csp-report stub.
+if [[ -f "${project_root}/angular/nginx.conf.template" ]]; then
+    # The `$uri` in the try_files needle is literal nginx syntax — NOT
+    # a shell expansion. shellcheck SC2016 is intentional here.
+    # shellcheck disable=SC2016
+    for needle in 'Content-Security-Policy-Report-Only' 'Strict-Transport-Security' 'X-Frame-Options "DENY"' \
+                  'X-Content-Type-Options "nosniff"' 'Referrer-Policy' 'location = /csp-report' \
+                  'location /getEnvConfig' 'try_files $uri /dynamic-env.json'; do
+        if ! grep -qF "$needle" "${project_root}/angular/nginx.conf.template"; then
+            echo "FAIL: nginx.conf.template missing needle: $needle" >&2
+            exit 1
+        fi
+    done
+else
+    echo "SKIP: angular/nginx.conf.template not present (UI=none?); nginx surface assertions skipped"
+fi
+
+# 6c. .env has the dev-safe OPENIDDICT_DEV_CERT_PASS + DB_PASSWORD defaults
+# (project name SmokeApp -> lowercase 'smokeapp').
+if ! grep -q '^OPENIDDICT_DEV_CERT_PASS=smokeapp-dev-cert-pass' "${project_root}/.env"; then
+    echo "FAIL: .env missing token-substituted OPENIDDICT_DEV_CERT_PASS default" >&2
+    exit 1
+fi
+if ! grep -q '^DB_PASSWORD=smokeapp-dev' "${project_root}/.env"; then
+    echo "FAIL: .env missing token-substituted DB_PASSWORD default" >&2
+    exit 1
+fi
+
+# 6d. Caddyfile.dev references the project-prefixed hostname env vars.
+if ! grep -qE '\$\{?APP_(API|WEB)_HOSTNAME\}?' "${project_root}/Caddyfile.dev"; then
+    echo "FAIL: Caddyfile.dev missing APP_(API|WEB)_HOSTNAME env-var references" >&2
+    exit 1
+fi
+
+echo "OK: unit-06 docker-overlay surfaces present"
+
 echo "OK: smoke test passed (solution at ${sln}; build log at ${smoke_dir}/build.log)"

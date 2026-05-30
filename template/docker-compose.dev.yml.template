@@ -1,0 +1,64 @@
+# docker-compose.dev.yml — dev overlay, auto-loaded by `docker compose`
+# via COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml in .env.
+#
+# What dev does differently vs. base:
+#   - Builds images locally from the per-project Dockerfiles (so source
+#     changes are always reflected; staging pulls from GHCR instead).
+#   - Exposes the Postgres port to the host for `psql` from your workstation.
+#   - api uses `Dockerfile.local` which mints an ephemeral OpenIddict
+#     dev signing cert inside the image — no host openiddict.pfx mount
+#     required.
+#   - Bind-mounts host-side `appsettings.secrets.json` files read-only
+#     (gitignored on the host).
+#   - No `restart: always` — let containers exit so you see crashes.
+
+services:
+  db:
+    ports:
+      # Dev convenience for `psql -h localhost -p 15432` from the host.
+      # Bound to 15432 (not the standard 5432) to avoid colliding with a
+      # host-side Postgres a developer may already run.
+      # Loopback-only — never expose dev Postgres to non-local clients.
+      - "127.0.0.1:15432:5432"
+
+  api:
+    build:
+      context: .
+      dockerfile: src/${PROJECT_NAME}.HttpApi.Host/Dockerfile.local
+      args:
+        # Required by Dockerfile.local (its first RUN line fails fast
+        # with a developer-friendly error if this is empty). The .env
+        # file ships a non-secret dev default.
+        OPENIDDICT_DEV_CERT_PASS: ${OPENIDDICT_DEV_CERT_PASS:?Set OPENIDDICT_DEV_CERT_PASS in .env}
+    volumes:
+      # READ-ONLY bind mount of the operator's dev secrets file. The
+      # file MUST exist on the host before `docker compose up`; see
+      # README / CLAUDE.md for the `cp ...template ...secrets.json`
+      # pre-flight step. The `:ro` flag is the blue-team contract —
+      # an attacker who breaches the container cannot tamper with the
+      # host file (only read it, which is the bind-mount tradeoff).
+      - ./src/${PROJECT_NAME}.HttpApi.Host/appsettings.secrets.json:/app/appsettings.secrets.json:ro
+      # Bind-mount the host-side `wwwroot/libs/` directory (created by
+      # `abp install-libs`, gitignored). ABP's AbpMvcLibsCheckMiddleware
+      # returns HTTP 500 if `/app/wwwroot/libs/` is missing or empty.
+      - ./src/${PROJECT_NAME}.HttpApi.Host/wwwroot/libs:/app/wwwroot/libs:ro
+      # openiddict.pfx is baked into the image by Dockerfile.local for
+      # dev — no host file mount needed.
+
+  migrator:
+    build:
+      context: .
+      dockerfile: src/Dockerfile.dotnet
+      target: migrator
+    volumes:
+      - ./src/${PROJECT_NAME}.DbMigrator/appsettings.secrets.json:/app/appsettings.secrets.json:ro
+
+  web:
+    build:
+      context: ./angular
+      dockerfile: Dockerfile
+
+  caddy:
+    # Dev uses HTTPS via Caddy's internal CA. `Caddyfile.dev` sets `tls internal`.
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile:ro

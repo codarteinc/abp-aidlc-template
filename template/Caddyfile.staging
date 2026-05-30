@@ -1,0 +1,47 @@
+# Caddyfile.staging — auto-HTTPS edge config for staging.
+#
+# Loaded by docker-compose.staging.yml. Caddy provisions Let's Encrypt
+# certs for any hostname that publicly resolves to this VM. Operator
+# sets APP_ACME_EMAIL in /etc/${PROJECT_NAME_LOWER}/.env.staging.
+
+{
+	email {$APP_ACME_EMAIL}
+	# Bind admin to loopback only (same defense-in-depth as Caddyfile.dev).
+	admin localhost:2019
+	# Default to LE STAGING during greenfield iteration to avoid burning
+	# the LE prod 50-certs/week quota during deploy back-and-forth.
+	# LE staging issues a real chain-trusted-by-LE-staging-root cert, but
+	# that root is NOT in any browser trust store — browsers show "Your
+	# connection is not private" once per origin until clicked through.
+	# Flip to LE production by commenting out the `acme_ca` line below
+	# once the stack is stable. If both LE staging and LE prod fail,
+	# Caddy falls back to `tls internal` automatically (visible in logs).
+	acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+# Public API endpoint (HTTPS auto-provisioned)
+{$APP_API_HOSTNAME} {
+	encode gzip
+	reverse_proxy api:8080 {
+		health_uri /health-live
+		health_interval 10s
+		health_timeout 3s
+	}
+}
+
+# Public SPA endpoint (HTTPS auto-provisioned)
+{$APP_WEB_HOSTNAME} {
+	encode gzip
+	reverse_proxy web:8080 {
+		health_uri /
+		health_interval 10s
+		health_timeout 3s
+	}
+
+	# Long-term cache for hashed assets (Angular CLI emits
+	# `main.<16-hex>.js` etc.) — anything with a hex content-hash in
+	# the basename is immutable. Non-hashed files (index.html,
+	# dynamic-env.json) keep nginx's default short TTL via the upstream.
+	@hashed path_regexp \.[a-f0-9]{16,}\.
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+}

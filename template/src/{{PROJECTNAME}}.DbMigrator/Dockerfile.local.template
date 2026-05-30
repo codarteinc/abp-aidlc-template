@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.7
+#
+# ${PROJECT_NAME}.DbMigrator — LOCAL DEVELOPMENT build.
+#
+# Intentionally close to the production Dockerfile target. The migrator
+# has no cert flow, no Kestrel, and runs to completion in a few seconds —
+# there is no inner-loop speed advantage to maintaining a separate local
+# variant beyond the project-scoped restore (skips ABP libs / api
+# publish).
+#
+# Build context: repository root. Build with:
+#   docker build -f src/${PROJECT_NAME}.DbMigrator/Dockerfile.local \
+#     -t ${PROJECT_NAME_LOWER}-dbmigrator:local .
+#
+# DIVERGENCE FROM PRODUCTION
+#   Production DbMigrator image builds from `src/Dockerfile.dotnet`
+#   (target `migrator`, shared `build` stage with the API). This
+#   local-dev variant is intentionally kept separate so a developer
+#   can build a migrator image without pulling in the API publish +
+#   libs path. The runtime stage is functionally identical to the
+#   `migrator` target of `src/Dockerfile.dotnet`. If/when a divergence
+#   is genuinely needed (e.g., debug symbols, an in-image psql client
+#   for ad-hoc DB inspection), edit THIS file — never the shared
+#   production one.
+
+# ---------------------------------------------------------------------------
+# build stage
+# ---------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/sdk:10.0-alpine@sha256:5c559aa5d99337e400d39ab4fa1f6979d126c29b20939d53658ed38300571e74 AS build
+WORKDIR /src
+
+# Project-scoped restore (NOT `dotnet restore ${PROJECT_NAME}.slnx`) —
+# keeps test/ out of the build context so test-only edits don't
+# invalidate the publish layer.
+COPY ${PROJECT_NAME}.slnx common.props global.json NuGet.Config ./
+COPY src/ ./src/
+
+RUN dotnet restore src/${PROJECT_NAME}.DbMigrator/${PROJECT_NAME}.DbMigrator.csproj -r linux-musl-x64
+
+RUN dotnet publish src/${PROJECT_NAME}.DbMigrator/${PROJECT_NAME}.DbMigrator.csproj \
+    -c Release \
+    --no-restore \
+    -r linux-musl-x64 \
+    --self-contained false \
+    -o /publish \
+    /p:UseAppHost=false
+
+# ---------------------------------------------------------------------------
+# runtime stage — ASP.NET base (NOT plain runtime).
+# ---------------------------------------------------------------------------
+# Mirrors the production Dockerfile decision: the DbMigrator transitively
+# requires `Microsoft.AspNetCore.App` (Serilog.AspNetCore + ABP modules),
+# so the plain dotnet/runtime base fails with "No frameworks were found"
+# at startup. ICU + tzdata leave globalization-invariant mode so configured
+# cultures resolve correctly.
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine@sha256:1e37a8236c558ae31bd6bc8144e38e6036b73cf1b0616fe56d79e60babb9d93b AS final
+
+RUN apk add --no-cache icu-libs icu-data-full tzdata
+
+# Same uid/gid contract as the API runtime — UID/GID 10001 is the
+# load-bearing value the staging deploy workflow's chown step expects.
+RUN addgroup -S -g 10001 ${PROJECT_NAME_LOWER} \
+ && adduser  -S -u 10001 -G ${PROJECT_NAME_LOWER} ${PROJECT_NAME_LOWER}
+
+WORKDIR /app
+COPY --from=build --chown=${PROJECT_NAME_LOWER}:${PROJECT_NAME_LOWER} /publish ./
+
+ENV DOTNET_RUNNING_IN_CONTAINER=true \
+    DOTNET_USE_POLLING_FILE_WATCHER=true \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+
+USER ${PROJECT_NAME_LOWER}
+
+# No EXPOSE — the migrator does not bind any port.
+# No HEALTHCHECK — one-shot Job; orchestrator reads the exit code.
+
+ENTRYPOINT ["dotnet", "${PROJECT_NAME}.DbMigrator.dll"]

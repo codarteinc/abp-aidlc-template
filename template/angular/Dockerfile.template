@@ -1,0 +1,96 @@
+# syntax=docker/dockerfile:1.7
+#
+# Angular SPA — production / staging image.
+#
+# Two-stage: yarn build the SPA in node:22-alpine, then serve the
+# resulting `dist/${PROJECT_NAME}/browser/` via nginx:alpine. The nginx
+# image's built-in entrypoint script renders `nginx.conf.template` →
+# `/etc/nginx/conf.d/default.conf` at container start via envsubst;
+# the custom `25-envsubst-dynamic-env.sh` (below) renders the SPA's
+# bootstrap config (`dynamic-env.json`) into the html dir on the same
+# pass.
+#
+# Build context: ./angular. Build with:
+#   docker build -f angular/Dockerfile -t ${PROJECT_NAME_LOWER}-web:<tag> ./angular
+
+# ---- build stage ----
+FROM node:22-alpine@sha256:968df39aedcea65eeb078fb336ed7191baf48f972b4479711397108be0966920 AS build
+WORKDIR /app
+
+# Corepack pins yarn to the version CI uses — no surprise upgrades from
+# the host yarn.
+RUN corepack enable && corepack prepare yarn@1.22.22 --activate
+
+COPY package.json yarn.lock ./
+RUN yarn install --frozen-lockfile --network-timeout 600000
+
+COPY . .
+RUN yarn build:prod
+
+# ---- runtime stage ----
+FROM nginx:alpine@sha256:dc48b7a872a79fb541ba5081d320b11b549231bc63ba465a7495afaa7d2ebcb8 AS final
+
+# Built bundle. Angular CLI emits dist/${PROJECT_NAME}/browser when the
+# `outputPath` config carries the SSR-shaped split (default for ng 17+).
+COPY --from=build /app/dist/${PROJECT_NAME}/browser /usr/share/nginx/html
+
+# nginx.conf.template is processed by the nginx:alpine built-in entrypoint
+# /docker-entrypoint.d/20-envsubst-on-templates.sh, which renders
+# /etc/nginx/templates/*.template -> /etc/nginx/conf.d/ at container start.
+# This unit's nginx.conf.template carries no ${VAR} tokens (matches LinkHub
+# canonical) — the envsubst pass is therefore a no-op on the nginx config
+# itself; the only runtime substitution happens on the dynamic-env.json
+# template via the custom 25-envsubst-dynamic-env.sh script below.
+COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+
+# dynamic-env.json.template is rendered by the custom entrypoint script
+# (25-envsubst-dynamic-env.sh) directly into the html dir so the
+# `/getEnvConfig` location's `try_files $uri /dynamic-env.json` can serve it.
+# It is deliberately NOT placed under /etc/nginx/templates/ because the
+# built-in entrypoint writes to /etc/nginx/conf.d/ only, which is not the
+# document root.
+COPY dynamic-env.json.template /etc/${PROJECT_NAME_LOWER}/dynamic-env.json.template
+
+# Custom entrypoint script: render dynamic-env.json into the html dir.
+# Runs after 20-envsubst-on-templates.sh (built-in) and before nginx starts.
+COPY docker-entrypoint.d/25-envsubst-dynamic-env.sh /docker-entrypoint.d/25-envsubst-dynamic-env.sh
+RUN chmod +x /docker-entrypoint.d/25-envsubst-dynamic-env.sh
+
+# Whitelist exactly which vars envsubst can substitute (don't clobber
+# nginx vars like $uri / $host). The `APP_*` prefix is the neutral
+# scaffolded namespace contract — same prefix regardless of project name,
+# matching the keys docker-compose.yml passes to the `web` service.
+ENV NGINX_ENVSUBST_FILTER='^APP_'
+
+# Default the optional CSP-allowlist var to empty so nginx doesn't fail
+# with "unknown variable" when the operator hasn't set Sentry. The built-in
+# 20-envsubst-on-templates.sh derives the allowlist from env vars that are
+# ACTUALLY SET; without a default, the placeholder would leak as a literal
+# ${APP_SENTRY_INGEST_ORIGIN} token and nginx would misread it as an
+# undefined nginx variable at startup. Compose always passes a value
+# (possibly empty), but standalone `docker run` shouldn't crash just for
+# skipping Sentry config.
+ENV APP_SENTRY_INGEST_ORIGIN=""
+
+# Non-root run for nginx (nginx:alpine 1.27+ has built-in non-root support
+# via `nginx` user). nginx.conf.template ships with `listen 8080
+# default_server;` directly — the 8080 port avoids CAP_NET_BIND_SERVICE
+# for the non-root `nginx` user.
+#
+# Directories that need to be writable by the `nginx` user at runtime:
+# - /var/cache/nginx: nginx proxy/fastcgi/scgi/uwsgi temp paths
+# - /usr/share/nginx/html: dynamic-env.json is rendered here by the custom entrypoint
+# - /run: nginx writes /run/nginx.pid
+# - /etc/nginx/conf.d: the built-in 20-envsubst-on-templates.sh entrypoint
+#   writes the rendered default.conf here at container start.
+RUN chown -R nginx:nginx /var/cache/nginx /usr/share/nginx/html /run /etc/nginx/conf.d
+
+# Unlike the api/migrator images (uid 10001), the web container does
+# NOT bind-mount any host secrets — it serves only the static SPA
+# bundle + the rendered /getEnvConfig from /usr/share/nginx/html, so no
+# host-uid-matching contract applies.
+USER nginx
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -q --spider http://localhost:8080/ || exit 1

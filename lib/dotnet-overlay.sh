@@ -64,13 +64,18 @@ fi
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-# _marker_style_for <file> -> echoes "csharp" | "json" | "msbuild"
+# _marker_style_for <file> -> echoes "csharp" | "json" | "msbuild" | "nginx"
 _marker_style_for() {
     local f="$1"
     case "$f" in
         *.cs)                              echo "csharp"  ;;
         *.csproj|*.props|*.targets)        echo "msbuild" ;;
         *.json)                            echo "json"    ;;
+        # nginx style (unit-06): `# <ScaffoldBlock name="X">` /
+        # `# </ScaffoldBlock>`. Byte-identical to the csharp style except
+        # the leading `#` instead of `//`. Matches *.conf and the unit-06
+        # split `*.conf.template` / `*.conf.template.base` filenames.
+        *.conf|*.conf.template|*.conf.template.base) echo "nginx"   ;;
         *)
             log_fail "_marker_style_for: unknown marker style for: $f" \
                 "_marker_style_for"
@@ -86,6 +91,7 @@ _marker_open_pattern() {
         csharp)  printf '// <ScaffoldBlock name="%s">' "$name" ;;
         msbuild) printf '<!-- <ScaffoldBlock name="%s"> -->' "$name" ;;
         json)    printf '"//scaffold-block-%s-start"' "$name" ;;
+        nginx)   printf '# <ScaffoldBlock name="%s">' "$name" ;;
         *) return 1 ;;
     esac
 }
@@ -100,6 +106,7 @@ _marker_close_pattern() {
         csharp)  printf '// </ScaffoldBlock>' ;;
         msbuild) printf '<!-- </ScaffoldBlock> -->' ;;
         json)    printf '"//scaffold-block-%s-end"' "$name" ;;
+        nginx)   printf '# </ScaffoldBlock>' ;;
         *) return 1 ;;
     esac
 }
@@ -120,7 +127,8 @@ _insert_empty_marker_pair() {
     local file="$1" anchor="$2" name="$3" style="$4" strategy="${5:-}"
     local after_brace=1
     case "$style" in
-        json) after_brace=0 ;;
+        json)  after_brace=0 ;;
+        nginx) after_brace=0 ;;
     esac
     # Caller override (set by merge_markers_into_existing per
     # ANCHOR / ANCHOR_INLINE directive).
@@ -145,6 +153,10 @@ _insert_empty_marker_pair() {
         json)
             open_line="${open}: \"\","
             close_line="${close}: \"\","
+            ;;
+        nginx)
+            open_line="$open"
+            close_line="$close"
             ;;
     esac
 
@@ -313,8 +325,8 @@ merge_markers_into_existing() {
 
     local current_anchor=""
     local current_strategy="after_brace"   # default for csharp/msbuild
-    # JSON style always uses inline (sentinel keys go right under "{").
-    if [[ "$style" == "json" ]]; then
+    # JSON + nginx styles always use inline (no Allman-brace lookup).
+    if [[ "$style" == "json" || "$style" == "nginx" ]]; then
         current_strategy="inline"
     fi
     local line directive rest block_name
@@ -330,7 +342,7 @@ merge_markers_into_existing() {
         case "$directive" in
             ANCHOR)
                 current_anchor="$rest"
-                if [[ "$style" == "json" ]]; then
+                if [[ "$style" == "json" || "$style" == "nginx" ]]; then
                     current_strategy="inline"
                 else
                     current_strategy="after_brace"

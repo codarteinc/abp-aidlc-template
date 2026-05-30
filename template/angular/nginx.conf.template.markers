@@ -1,0 +1,16 @@
+# Marker directives for angular/nginx.conf.template.
+#
+# nginx style: `# <ScaffoldBlock name="X">` / `# </ScaffoldBlock>` —
+# byte-identical to the C# style except for the leading `#`. The unit-06
+# docker-overlay phase splices the unit-05 security-headers block + the
+# unit-04 /getEnvConfig snippet into the empty marker pairs declared here.
+#
+# Both markers anchor on `server_name  _;` (ANCHOR_INLINE — nginx style
+# always uses inline placement, no Allman-brace lookup). Markers land in
+# REVERSE declaration order because each insertion pushes the previous
+# marker pair further down: declaring getenvconfig first then security-
+# headers second yields a final file with security-headers ABOVE
+# getenvconfig.
+ANCHOR ^[[:space:]]*server_name[[:space:]]+_;[[:space:]]*$
+BLOCK getenvconfig
+BLOCK security-headers

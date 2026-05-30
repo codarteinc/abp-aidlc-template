@@ -210,9 +210,12 @@ teardown() {
     [ ! -f "$TARGET/.gitignore.tmpl" ]
     [ ! -f "$TARGET/.dockerignore.tmpl" ]
     ! find "$TARGET" -name '*.markers' | grep -q .
-    # ${PROJECT_NAME} token resolved everywhere.
-    ! grep -rE '\$\{PROJECT_NAME[^}]*\}' "$TARGET/src" "$TARGET/test" \
-        2>/dev/null
+    # ${PROJECT_NAME} token resolved everywhere — EXCEPT in *.template
+    # files, which phase_apply_overlays intentionally skips because they
+    # are deploy-time envsubst targets (rendered later by either
+    # phase_apply_docker_overlay or external deploy tooling).
+    ! grep -rE --include='*' --exclude='*.template' \
+        '\$\{PROJECT_NAME[^}]*\}' "$TARGET/src" "$TARGET/test" 2>/dev/null
 }
 
 @test "phase_apply_overlays sets RootNamespace on every csproj under src/ + test/" {

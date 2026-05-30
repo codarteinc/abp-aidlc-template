@@ -1,0 +1,192 @@
+# docker-compose.yml — base stack for ${PROJECT_NAME}.
+#
+# This file is the shared service skeleton: services, networks, ports,
+# healthchecks, depends_on relationships. Each environment layers an
+# overlay on top:
+#
+#   dev  : docker compose up                       (auto-loads docker-compose.dev.yml via COMPOSE_FILE)
+#   stage: docker compose -f docker-compose.yml -f docker-compose.staging.yml up
+#
+# Secrets are bind-mounted read-only by the overlays. Compose `secrets:`
+# block is intentionally NOT used — single-host operator-managed secrets
+# don't need the k8s-flavored complexity, and bind-mounts let operators
+# rotate by editing the host file with no compose redeploy.
+
+name: ${PROJECT_NAME_LOWER}
+
+# Shared hardening applied to every service. `no-new-privileges` prevents
+# setuid / file-capability escalation if an attacker gets a shell.
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  # ---------------------------------------------------------------------------
+  # db — Postgres. Healthcheck blocks dependents until ready.
+  # ---------------------------------------------------------------------------
+  db:
+    <<: *hardening
+    image: postgres:17-alpine
+    container_name: ${PROJECT_NAME_LOWER}-db
+    environment:
+      POSTGRES_DB: ${PROJECT_NAME}
+      POSTGRES_USER: ${PROJECT_NAME_LOWER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD env var required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PROJECT_NAME_LOWER} -d ${PROJECT_NAME}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks: [${PROJECT_NAME_LOWER}]
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # migrator — EF Core migrations + ABP data seeders. One-shot.
+  # `profiles: [migrate, full]` keeps it out of plain `docker compose up`.
+  #   docker compose --profile full up                          (full stack incl. migration)
+  #   docker compose --profile migrate run --rm migrator        (migration only)
+  # ---------------------------------------------------------------------------
+  migrator:
+    <<: *hardening
+    image: ${PROJECT_NAME_LOWER}-dbmigrator:${MIGRATOR_VERSION:-local}
+    container_name: ${PROJECT_NAME_LOWER}-migrator
+    profiles: [migrate, full]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ConnectionStrings__Default: "Host=db;Port=5432;Database=${PROJECT_NAME};Username=${PROJECT_NAME_LOWER};Password=${DB_PASSWORD}"
+      # Fail fast at `docker compose up` time if APP_ENVIRONMENT is unset.
+      ASPNETCORE_ENVIRONMENT: ${APP_ENVIRONMENT:?APP_ENVIRONMENT must be set in .env}
+      DOTNET_RUNNING_IN_CONTAINER: "true"
+    restart: "no"
+    networks: [${PROJECT_NAME_LOWER}]
+
+  # ---------------------------------------------------------------------------
+  # api — ${PROJECT_NAME}.HttpApi.Host. Behind Caddy at $API_PUBLIC_URL.
+  # ---------------------------------------------------------------------------
+  api:
+    <<: *hardening
+    image: ${PROJECT_NAME_LOWER}-api:${API_VERSION:-local}
+    container_name: ${PROJECT_NAME_LOWER}-api
+    depends_on:
+      db:
+        condition: service_healthy
+      # NOTE: when launched with `--profile full` the migrator service is
+      # enabled and this dependency holds; without a profile the migrator
+      # is filtered out and depends_on is silently skipped.
+      migrator:
+        condition: service_completed_successfully
+        required: false
+    environment:
+      ConnectionStrings__Default: "Host=db;Port=5432;Database=${PROJECT_NAME};Username=${PROJECT_NAME_LOWER};Password=${DB_PASSWORD}"
+      ASPNETCORE_ENVIRONMENT: ${APP_ENVIRONMENT:?APP_ENVIRONMENT must be set in .env}
+      ASPNETCORE_URLS: http://+:8080
+      AuthServer__CertificatePath: /app/openiddict.pfx
+      # The Docker network's IPAM subnet (see `networks` below).
+      # Tight CIDR keeps ForwardedHeaders strict (least-privilege).
+      ForwardedHeaders__KnownIPNetworks__0: ${KNOWN_PROXY_CIDR:-172.30.0.0/16}
+      App__SelfUrl: ${API_PUBLIC_URL}
+      App__AngularUrl: ${WEB_PUBLIC_URL}
+      App__CorsOrigins: ${WEB_PUBLIC_URL}
+      App__RedirectAllowedUrls: ${WEB_PUBLIC_URL}
+      AuthServer__Authority: ${API_PUBLIC_URL}/
+    healthcheck:
+      # Same as the in-image Dockerfile HEALTHCHECK.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health-live"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 6
+    networks: [${PROJECT_NAME_LOWER}]
+
+  # ---------------------------------------------------------------------------
+  # web — Angular SPA served by nginx. envsubst renders dynamic-env.json
+  # from the APP_* env vars below at container start (no rebuild required
+  # to repoint between environments).
+  # ---------------------------------------------------------------------------
+  web:
+    <<: *hardening
+    image: ${PROJECT_NAME_LOWER}-web:${WEB_VERSION:-local}
+    container_name: ${PROJECT_NAME_LOWER}-web
+    environment:
+      APP_BASE_URL: ${WEB_PUBLIC_URL}
+      APP_API_URL: ${API_PUBLIC_URL}
+      APP_API_ORIGIN: ${API_PUBLIC_URL}
+      APP_OAUTH_ISSUER: ${API_PUBLIC_URL}/
+      # OIDC redirect_uri requires EXACT match (no trailing slash).
+      APP_OAUTH_REDIRECT: ${WEB_PUBLIC_URL}
+      APP_OAUTH_CLIENT_ID: ${PROJECT_NAME}_App
+      APP_OAUTH_SCOPE: "offline_access ${PROJECT_NAME}"
+      APP_NAME: ${PROJECT_NAME}
+      APP_ROOT_NAMESPACE: ${PROJECT_NAME}
+      APP_SHOW_SOCIAL_PROOF: ${APP_SHOW_SOCIAL_PROOF:-false}
+      APP_SHOW_ACTIVITY_FEED: ${APP_SHOW_ACTIVITY_FEED:-false}
+      APP_SENTRY_DSN: ${APP_SENTRY_DSN:-}
+      APP_SENTRY_ENVIRONMENT: ${APP_ENVIRONMENT:?APP_ENVIRONMENT must be set in .env}
+      APP_SENTRY_RELEASE: ${WEB_VERSION:-local}
+      # CSP `connect-src` allowlist entry for Sentry beacons.
+      APP_SENTRY_INGEST_ORIGIN: ${APP_SENTRY_INGEST_ORIGIN:-}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    networks: [${PROJECT_NAME_LOWER}]
+
+  # ---------------------------------------------------------------------------
+  # caddy — edge reverse-proxy. `service_started` (NOT `service_healthy`)
+  # so first-boot debugging doesn't hang on an unhealthy backend; Caddy
+  # owns request-time routing-to-healthy via `reverse_proxy { health_uri }`.
+  # ---------------------------------------------------------------------------
+  caddy:
+    <<: *hardening
+    image: caddy:2.8-alpine
+    container_name: ${PROJECT_NAME_LOWER}-caddy
+    depends_on:
+      api:
+        condition: service_started
+      web:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+      # HTTP/3 (443/udp) intentionally NOT exposed — defer until needed.
+    environment:
+      APP_API_HOSTNAME: ${APP_API_HOSTNAME:-api.localhost}
+      APP_WEB_HOSTNAME: ${APP_WEB_HOSTNAME:-localhost}
+      APP_ACME_EMAIL: ${APP_ACME_EMAIL:-}
+    volumes:
+      # The Caddyfile mount is supplied by the overlay (dev or staging).
+      - caddy-data:/data
+      - caddy-config:/config
+    healthcheck:
+      # Probe Caddy's admin endpoint on internal port 2019 (NOT exposed
+      # to the host). Use 127.0.0.1 (not `localhost`) — the container's
+      # DNS resolver may append a host-supplied search domain to bare
+      # `localhost`, resolving it off-loopback.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks: [${PROJECT_NAME_LOWER}]
+
+networks:
+  ${PROJECT_NAME_LOWER}:
+    driver: bridge
+    ipam:
+      config:
+        # Explicit subnet so ForwardedHeaders:KnownIPNetworks pins a
+        # deterministic CIDR. 172.30.0.0/16 is outside Docker's default
+        # address pools — avoids host-platform variance and collisions
+        # with the default bridge.
+        - subnet: 172.30.0.0/16
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:
