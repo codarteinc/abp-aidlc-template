@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # Nightly smoke run — 06:00 UTC.
+    - cron: '0 6 * * *'
 
 jobs:
   shellcheck:
@@ -21,12 +25,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install bats
         run: sudo apt-get update && sudo apt-get install -y bats
-      - name: Run bats
+      - name: Run bats fast tier
+        # Only the top-level tests/ glob — explicitly excludes tests/smoke/
+        # which is gated behind RUN_SMOKE_TESTS=1 in the smoke job below.
         run: |
           if compgen -G 'tests/*.bats' > /dev/null; then
             bats tests/
           else
-            echo "no .bats files yet — unit-11 populates the smoke suite"
+            echo "no .bats files yet"
           fi
 
   token-coverage:
@@ -47,4 +53,95 @@ jobs:
           ~/.local/bin/yamllint -d relaxed \
             scaffold-config-schema.yml \
             scaffold-config.example.yml \
-            .github/workflows/
+            .github/workflows/ \
+            tests/fixtures/smoke/
+
+  markdownlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install markdownlint-cli
+        run: npm install -g markdownlint-cli
+      - name: Run markdownlint
+        run: |
+          markdownlint -c .markdownlint.json \
+            README.md USAGE.md CHANGELOG.md docs/*.md tests/smoke/README.md
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          sudo mv actionlint /usr/local/bin/
+      - name: Lint .github/workflows/
+        run: actionlint
+      - name: Install gettext (envsubst)
+        run: sudo apt-get update && sudo apt-get install -y gettext-base
+      - name: Lint template/.github/workflows/ (after substitution)
+        run: bash scripts/lint-template-workflows.sh
+
+  terraform-fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Install gettext (envsubst)
+        run: sudo apt-get update && sudo apt-get install -y gettext-base
+      - name: terraform fmt -check (template tree)
+        run: bash scripts/lint-template-terraform.sh fmt
+
+  terraform-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Install gettext (envsubst)
+        run: sudo apt-get update && sudo apt-get install -y gettext-base
+      - name: terraform validate (template tree)
+        run: bash scripts/lint-template-terraform.sh validate
+
+  smoke:
+    # Slow tier — only on workflow_dispatch + nightly schedule, never on
+    # PR. Total per-shard runtime: 7-10 min worst case. All three shards
+    # in parallel total wall time ~10-12 min.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        combo: [linkhub_equivalent, app_nolayers, mvc_ui]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install yarn
+        run: npm install -g yarn
+      - name: Install yq (Mike Farah)
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+      - name: Install abp CLI
+        run: dotnet tool install -g Volo.Abp.Studio.Cli
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ matrix.combo }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            nuget-${{ matrix.combo }}-
+      - name: Run smoke combo
+        env:
+          RUN_SMOKE_TESTS: '1'
+        run: bats tests/smoke/${{ matrix.combo }}.bats
