@@ -1,0 +1,20 @@
+# tests/fixtures/smoke/mvc-ui.yml — schema-valid config for the MVC UI
+# variant: app + mvc + ef + postgresql.
+
+project_name: SmokeMvc
+github_owner: codarteinc-test
+
+abp:
+  template: app
+  ui: mvc
+  db_provider: ef
+  dbms: postgresql
+  tiered: false
+  multi_tenancy: false
+  default_culture: en
+  optional_modules: []
+
+infra:
+  hetzner_location: hel1
+  hetzner_server_type: cx23
+  cloudflare_zone: REPLACE_ME
