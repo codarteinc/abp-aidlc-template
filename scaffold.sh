@@ -12,6 +12,7 @@
 #   scaffold.sh --config my-app.yml          # config-file mode
 #   scaffold.sh --config ... --target DIR    # override target dir
 #   scaffold.sh --config ... --dry-run       # run all phases as no-ops, exit 0
+#   scaffold.sh --config ... --skip-gh-create  # skip gh repo create + push + branch protection
 #   scaffold.sh --help                       # show usage banner
 #
 # Exit codes:
@@ -55,6 +56,17 @@ CONFIG_PATH=""
 TARGET_DIR=""
 DRY_RUN=0
 DRY_RUN_ABP_NEW=0
+# unit-10 — pre-push escape hatches.
+# SKIP_GH_CREATE: documented flag — operator-visible in --help. Skips
+#   gh repo create / push / branch-protection / workflow-perms check.
+#   Local git init + initial commit still happen.
+# DRY_RUN_GITHUB: undocumented; bats-only. Causes gh-touching helpers
+#   to print 'GH_CMD: ...' lines and return 0 WITHOUT invoking gh.
+# SKIP_POST_INIT: undocumented; operator/test escape hatch when the
+#   dotnet/abp/yarn toolchain isn't available on the running host.
+SKIP_GH_CREATE="${SKIP_GH_CREATE:-false}"
+DRY_RUN_GITHUB="${DRY_RUN_GITHUB:-0}"
+SKIP_POST_INIT="${SKIP_POST_INIT:-0}"
 # ABP_VERSION may be set by --abp-version flag, by env, or autodetected
 # inside phase_abp_new. Initialize from env so an operator export wins
 # over autodetect but loses to an explicit --abp-version flag.
@@ -76,6 +88,9 @@ FLAGS:
                         tests of the orchestration pipeline.
   --abp-version <X.Y.Z> Pin the ABP framework version passed to 'abp new'.
                         Defaults to the locally-installed CLI's reported version.
+  --skip-gh-create      Skip 'gh repo create' (and the push + branch-protection
+                        + workflow-perms check). git init + initial commit
+                        still happen so the operator can push manually later.
   --help, -h            Show this banner.
 
 CONFIG FLAGS (enumerated from scaffold-config-schema.yml):
@@ -119,6 +134,29 @@ while [[ $# -gt 0 ]]; do
             # print the assembled flag array and return 0 without invoking
             # the real `abp new` binary.
             DRY_RUN_ABP_NEW=1
+            shift
+            ;;
+        --dry-run-github)
+            # Test-only short-circuit for bats. Intentionally undocumented
+            # in --help. Causes phase_github_repo_init's gh-touching
+            # helpers to print 'GH_CMD: <cmd>' lines and return 0 WITHOUT
+            # invoking the real gh CLI. git init + initial commit DO
+            # still happen (we want the bats tests to verify the commit
+            # graph).
+            DRY_RUN_GITHUB=1
+            shift
+            ;;
+        --skip-gh-create)
+            # Operator-visible escape hatch. Runs git init + initial
+            # commit but skips gh repo create / push / branch-protection.
+            SKIP_GH_CREATE=true
+            shift
+            ;;
+        --skip-post-init)
+            # Test/operator escape hatch when the dotnet/abp/yarn
+            # toolchain is not available on the running host. Causes
+            # phase_run_post_init_commands to log_info + return 0.
+            SKIP_POST_INIT=1
             shift
             ;;
         --help|-h)
@@ -811,18 +849,106 @@ phase_apply_github_workflows_overlay() {
 }
 
 phase_run_post_init_commands() {
-    _phase_start "phase_run_post_init_commands (stub — unit-10)"
-    log_info "post-init commands populate here in unit-10"
+    _phase_start "phase_run_post_init_commands"
+
+    # Dry-run / --skip-post-init short-circuit. phase_apply_overlays
+    # produced no real tree under --dry-run / --dry-run-abp-new — there
+    # is nothing meaningful to dotnet-build against.
+    if (( DRY_RUN == 1 )) || (( DRY_RUN_ABP_NEW == 1 )) \
+        || (( SKIP_POST_INIT == 1 )); then
+        log_info "[post-init] dry-run / --skip-post-init: skipping"
+        return 0
+    fi
+
+    if [[ -z "${TARGET_DIR:-}" || ! -d "$TARGET_DIR" ]]; then
+        log_warn "[post-init] TARGET_DIR missing; skipping"
+        return 0
+    fi
+
+    # shellcheck source=lib/post-init.sh disable=SC1091
+    source "${LIB_DIR}/post-init.sh"
+
+    local target_real
+    target_real="$(realpath "$TARGET_DIR")"
+
+    post_init_run_ef_migration       "$target_real" || return 1
+    post_init_install_libs           "$target_real" || return 1
+    post_init_smoke_dotnet_build     "$target_real" || return 1
+
+    log_ok "post-init commands complete"
 }
 
 phase_github_repo_init() {
-    _phase_start "phase_github_repo_init (stub — unit-10)"
-    log_info "github repo init populates here in unit-10"
+    _phase_start "phase_github_repo_init"
+
+    if (( DRY_RUN == 1 )) || (( DRY_RUN_ABP_NEW == 1 )); then
+        log_info "[github-init] dry-run: skipping"
+        return 0
+    fi
+    if [[ -z "${TARGET_DIR:-}" || ! -d "$TARGET_DIR" ]]; then
+        log_warn "[github-init] TARGET_DIR missing; skipping"
+        return 0
+    fi
+
+    # shellcheck source=lib/github-init.sh disable=SC1091
+    source "${LIB_DIR}/github-init.sh"
+    # shellcheck source=lib/handoff.sh disable=SC1091
+    source "${LIB_DIR}/handoff.sh"
+
+    local target_real
+    target_real="$(realpath "$TARGET_DIR")"
+
+    # Pre-commit safety: a known-dangerous file inside the target must
+    # NOT be staged by `git add -A`. Fail loudly if the .gitignore would
+    # let one through.
+    handoff_assert_safe_to_commit "$target_real" || return 1
+
+    github_init_git_repo "$target_real" || return 1
+
+    if [[ "${SKIP_GH_CREATE:-false}" == "true" ]]; then
+        log_info "[github-init] --skip-gh-create: skipping gh repo create + push + branch protection"
+        return 0
+    fi
+
+    # gh auth precondition. phase_preflight verifies the gh BINARY;
+    # here we verify the auth is wired. Hard fail before touching any
+    # GitHub state. Bypass when --dry-run-github (tests can't be
+    # expected to be `gh auth login`'d).
+    if (( DRY_RUN_GITHUB == 0 )); then
+        if ! gh auth status >/dev/null 2>&1; then
+            log_fail "[github-init] gh CLI not authenticated; run 'gh auth login' first" \
+                "gh auth status"
+            return 1
+        fi
+    fi
+
+    github_init_create_remote        "$target_real" || return 1
+    github_init_branch_protection    "$target_real" || true   # soft-fail
+    github_init_check_workflow_perms "$target_real" || true   # report-only
+
+    log_ok "github-init complete"
 }
 
 phase_handoff() {
-    _phase_start "phase_handoff (stub — unit-10)"
-    log_info "scaffold complete — see operator handoff in unit-10"
+    _phase_start "phase_handoff"
+
+    if (( DRY_RUN == 1 )) || (( DRY_RUN_ABP_NEW == 1 )); then
+        log_info "[handoff] dry-run: skipping"
+        return 0
+    fi
+    if [[ -z "${TARGET_DIR:-}" || ! -d "$TARGET_DIR" ]]; then
+        log_warn "[handoff] TARGET_DIR missing; skipping"
+        return 0
+    fi
+
+    # shellcheck source=lib/handoff.sh disable=SC1091
+    source "${LIB_DIR}/handoff.sh"
+
+    local target_real
+    target_real="$(realpath "$TARGET_DIR")"
+
+    handoff_render_message "$target_real" || return 1
+    log_ok "operator handoff written to ${target_real}/SCAFFOLD-HANDOFF.md"
 }
 
 # --- main -----------------------------------------------------------------
