@@ -1,0 +1,155 @@
+# terraform/staging — ${PROJECT_NAME} Hetzner staging VM (root module)
+
+Thin root module that instantiates the shared
+[`terraform/modules/${PROJECT_NAME}-env`](../modules/${PROJECT_NAME}-env/README.md)
+module with staging's variable values, declares the
+`hetznercloud/hcloud` + `cloudflare/cloudflare` providers, and configures
+the HCP Terraform `cloud {}` backend (workspace `${PROJECT_NAME_LOWER}-staging`).
+
+All resource definitions, locals, and cloud-init live in the shared
+module — see the module README for the input/output reference. This README
+documents the **root-specific** concerns: which variables to set, where
+state lives, and how to operate the env.
+
+Full operator guide: [`docs/staging-runbook.md`](../../docs/staging-runbook.md)
+— first-time setup (Hetzner + HCP + GitHub Environment), deploy +
+rollback procedures (when unit-08 lands the workflows), SSH/IP rotation,
+Cloudflare-domain flip, and the troubleshooting catalogue.
+
+## Module shape
+
+```
+terraform/
+├── modules/${PROJECT_NAME}-env/   # shared module — VM + firewall + DNS + cloud-init
+└── staging/                       # this dir — provider + backend config + module call
+    ├── main.tf                    # provider blocks + module instantiation
+    ├── variables.tf               # operator-facing knobs (forwarded to the module)
+    ├── outputs.tf                 # forwarded module outputs (preserved names)
+    ├── versions.tf                # required_version + required_providers + cloud {} backend
+    ├── terraform.tfvars.example
+    ├── rebootstrap.sh             # operator helper — destroy + apply + smoke test
+    ├── scripts/                   # lint-cloud-init.sh wrapper
+    └── test/                      # validate-only tfvars (cloudflare schema check)
+```
+
+Unlike LinkHub's staging root, **no `moved.tf` ships in the scaffold** —
+there's no pre-refactor flat state to migrate from. Add a `moved.tf` to
+this directory only when YOU rename / restructure resources after the
+first apply. The module's `README.md` ships a worked example.
+
+## Prerequisites
+
+1. **HCP Terraform workspace** `${PROJECT_NAME_LOWER}-staging` exists under
+   the `${HCP_ORG}` organization (or whatever org slug your account uses
+   — edit `versions.tf` if different). Settings → General → **Execution
+   Mode = Local**. Without "Local" set, HCP tries to run `terraform
+   apply` on its own runners and fails (no Hetzner / Cloudflare tokens
+   there). See `docs/staging-runbook.md` §2.3.
+2. **Hetzner Cloud API token** with Read+Write scope on the project
+   that will host the VM. Get it from Hetzner Cloud Console → project →
+   Security → API Tokens.
+3. **Tooling locally:** `terraform >= 1.10`, `shellcheck >= 0.9`,
+   `python3` (with `pyyaml` — `apt install python3-yaml`).
+
+## Quick reference
+
+```bash
+# 1. Copy the tfvars template and fill in REQUIRED values.
+cp terraform.tfvars.example terraform.tfvars
+# edit: ssh_allowed_cidrs + operator_ssh_pubkeys
+
+# 2. Export secrets as env vars (do NOT put them in *.tfvars).
+export TF_VAR_hcloud_token="hetzner-api-token-from-console"
+# Optional, only if dns_provider = "cloudflare":
+# export TF_VAR_cloudflare_api_token="cloudflare-zone-edit-token"
+
+# 3. One-time init (downloads providers + wires HCP backend).
+terraform init
+
+# 4. Preview + apply.
+terraform plan
+terraform apply
+
+# 5. Wait for cloud-init to finish (~3-5 min after apply returns).
+ssh deploy@$(terraform output -raw vm_ipv4) 'cloud-init status --wait'
+
+# 6. Smoke-test the load-bearing invariants.
+ssh deploy@$(terraform output -raw vm_ipv4) '
+  stat -c "%a %U:%G" /var/lib/${PROJECT_NAME_LOWER}/db &&  # expect: 700 ?:? (70:70)
+  stat -c "%a %U:%G" /etc/${PROJECT_NAME_LOWER}/api &&     # expect: 750 root:deploy
+  test -f /var/lib/${PROJECT_NAME_LOWER}/.bootstrap-complete && echo MARKER OK
+'
+```
+
+## Operator-facing variables
+
+| Variable | Required? | Default | Notes |
+|---|---|---|---|
+| `ssh_allowed_cidrs` | yes | — | CIDR allowlist for SSH (port 22) + ICMP. |
+| `operator_ssh_pubkeys` | yes | — | Map of `{ short-name = "ssh-ed25519 AAAA... ..." }`. |
+| `hcloud_token` | yes | — | Pass via `TF_VAR_hcloud_token` env var. Never commit. |
+| `app_hostname` | optional | `""` | SPA hostname. Empty + `dns_provider = "none"` → sslip.io fallback. |
+| `api_hostname` | optional | `""` | API hostname. Empty + `dns_provider = "none"` → sslip.io fallback. |
+| `server_type` | optional | `"${HETZNER_SERVER_TYPE}"` | Hetzner server type. |
+| `server_location` | optional | `"${HETZNER_LOCATION}"` | Hetzner location. |
+| `server_image` | optional | `"ubuntu-24.04"` | Only `ubuntu-24.04` supported. |
+| `dns_provider` | optional | `"none"` | `"none"` or `"cloudflare"`. |
+| `cloudflare_zone_id` | conditional | `""` | Required when `dns_provider = "cloudflare"`. |
+| `cloudflare_api_token` | conditional | `""` | Required when `dns_provider = "cloudflare"`. Pass via `TF_VAR_cloudflare_api_token`. |
+
+Full input reference (with validation rules) lives in the module:
+[`../modules/${PROJECT_NAME}-env/README.md`](../modules/${PROJECT_NAME}-env/README.md).
+
+## Outputs (preserved names — workflow-stable)
+
+| Output | From module | Notes |
+|---|---|---|
+| `vm_ipv4` | `module.${PROJECT_NAME_LOWER}_env.vm_ipv4` | Sticky primary IPv4. |
+| `vm_ipv6` | `module.${PROJECT_NAME_LOWER}_env.vm_ipv6` | Free /64 from Hetzner. |
+| `ssh_command` | `module.${PROJECT_NAME_LOWER}_env.ssh_command` | `ssh deploy@<ipv4>`. |
+| `spa_hostname` | `module.${PROJECT_NAME_LOWER}_env.app_hostname` | Deliberate alias — unit-08's deploy workflows call it `spa_hostname`. |
+| `api_hostname` | `module.${PROJECT_NAME_LOWER}_env.api_hostname` | Operator value or sslip.io fallback. |
+
+## Lifecycle notes
+
+- **Cloud-init runs ONCE at first boot.** Re-running `terraform apply`
+  does NOT re-run cloud-init on an existing VM. To re-bootstrap:
+  `./rebootstrap.sh` (preferred — also waits for SSH + cloud-init +
+  runs the smoke test), or raw
+  `terraform destroy -target=module.${PROJECT_NAME_LOWER}_env.hcloud_server.app && terraform apply`.
+  The primary IP survives (`auto_delete = false`).
+- **Server-type bumps rebuild in place** (~30s downtime). The VM stays
+  at the same IP. Bind-mount data (`/var/lib/${PROJECT_NAME_LOWER}/db`)
+  survives the local-NVMe → local-NVMe path; cx → ccx flips storage
+  backend and is NOT safe.
+- **Hetzner Cloud Backups feature is disabled** (20% surcharge).
+  Snapshots + pg_dump backups belong to a later intent.
+
+## Adding a new env
+
+Don't hand-clone this directory — use the helper:
+
+```bash
+# From the repo root:
+./scripts/new-terraform-env.sh production
+```
+
+The helper copies `terraform/staging/` to the new env, rewrites the HCP
+workspace name + `env_name`, and prints the operator-next-steps banner
+(create HCP workspace, fill tfvars, etc.). Run `--dry-run` first to see
+what will change. Full bringup checklist in
+[`docs/staging-runbook.md`](../../docs/staging-runbook.md).
+
+## Verification gates (run before committing changes)
+
+```bash
+terraform fmt -recursive
+terraform fmt -check -recursive
+( cd ../modules/${PROJECT_NAME}-env && terraform init -backend=false && terraform validate )
+terraform init -backend=false
+terraform validate
+terraform validate -var-file=test/cloudflare.tfvars   # provider-schema drift check
+bash scripts/lint-cloud-init.sh   # defaults to ../modules/${PROJECT_NAME}-env/cloud-init.yaml.tftpl
+```
+
+All must pass with zero findings.

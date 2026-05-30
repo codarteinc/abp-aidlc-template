@@ -1,0 +1,166 @@
+# `${PROJECT_NAME_LOWER}-env` Terraform module
+
+Reusable Terraform module that provisions a single ${PROJECT_NAME} environment
+on Hetzner Cloud: VM + firewall + sticky primary IPv4 + optional Cloudflare
+DNS records + cloud-init bootstrap. Consumed by per-env root modules
+(`terraform/staging/`, `terraform/staging2/`, ...) — each root configures its
+own HCP `cloud {}` backend + provider credentials and instantiates this
+module with env-specific inputs.
+
+The module is provider- and backend-agnostic: it does NOT declare a
+`cloud {}` block and it does NOT declare `provider "hcloud" {}` or
+`provider "cloudflare" {}`. That's the consuming root's responsibility per
+standard Terraform module conventions.
+
+## What the module manages
+
+| Resource | Name | Purpose |
+|---|---|---|
+| `hcloud_ssh_key.operators` | `${PROJECT_NAME_LOWER}-<env>-operator-<key>` | One per operator pubkey. Injected at server-create. |
+| `hcloud_firewall.app` | `${PROJECT_NAME_LOWER}-<env>-firewall` | Ports 22 (allowlisted), 80, 443 (world), ICMP (allowlisted). |
+| `hcloud_firewall_attachment.app` | (no name) | Firewall ↔ server binding. |
+| `hcloud_primary_ip.app` | `${PROJECT_NAME_LOWER}-<env>-ipv4` | Sticky IPv4, `auto_delete = false`. |
+| `hcloud_server.app` | `${PROJECT_NAME_LOWER}-<env>-app` | The VM. `user_data` = rendered cloud-init.yaml.tftpl. |
+| `hcloud_rdns.app` | (no name) | PTR record for the IPv4 (cosmetic). |
+| `cloudflare_dns_record.app_a` | (n/a) | SPA A record — only when `dns_provider = "cloudflare"`. |
+| `cloudflare_dns_record.app_aaaa` | (n/a) | SPA AAAA record — only when `dns_provider = "cloudflare"`. |
+| `cloudflare_dns_record.api_a` | (n/a) | API A record — only when `dns_provider = "cloudflare"`. |
+| `cloudflare_dns_record.api_aaaa` | (n/a) | API AAAA record — only when `dns_provider = "cloudflare"`. |
+
+## Requirements
+
+| Name | Version |
+|---|---|
+| terraform | `~> 1.10` |
+| `hetznercloud/hcloud` | `~> 1.63` |
+| `cloudflare/cloudflare` | `~> 5.0` |
+
+## Inputs
+
+### Required (6)
+
+| Name | Type | Description |
+|---|---|---|
+| `env_name` | `string` | Short environment slug (`staging`, `staging2`, ...). Used as the resource-name suffix and as the `env` label on every Hetzner resource. Must match `^[a-z0-9][a-z0-9-]*$`. |
+| `hcloud_token` | `string` (sensitive) | Hetzner Cloud API token (Read+Write, single project). Pass via `TF_VAR_hcloud_token` in the consuming root. |
+| `operator_ssh_pubkeys` | `map(string)` | Map of operator pubkeys keyed by a stable short name (e.g., `{ "alice-laptop" = "ssh-ed25519 AAAA... alice@laptop" }`). The map key names the `hcloud_ssh_key`; the value is the pubkey line. Must contain ≥1 entry. |
+| `ssh_allowed_cidrs` | `list(string)` | CIDR blocks allowed to SSH (port 22) and ICMP into the VM. Every entry must be a valid CIDR (e.g., `203.0.113.7/32`). Must contain ≥1 entry. |
+| `app_hostname` | `string` | Fully-qualified hostname for the SPA edge (e.g., `app.staging.example.com`). Empty string + `dns_provider = "none"` → sslip.io fallback. |
+| `api_hostname` | `string` | Fully-qualified hostname for the API edge (e.g., `api.staging.example.com`). Empty string + `dns_provider = "none"` → sslip.io fallback. |
+
+### Optional (6) — defaults match the scaffold-config-supplied values
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `server_type` | `string` | `"${HETZNER_SERVER_TYPE}"` | Hetzner Cloud server type. Bump up once the stack starts swapping. |
+| `server_location` | `string` | `"${HETZNER_LOCATION}"` | Hetzner datacenter park. One of `nbg1`, `fsn1`, `hel1`. |
+| `server_image` | `string` | `"ubuntu-24.04"` | Hetzner Cloud image. Only `ubuntu-24.04` is supported (cloud-init pins Docker apt repo to `noble`). |
+| `dns_provider` | `string` | `"none"` | `"none"` → no Cloudflare records, sslip.io fallback. `"cloudflare"` → instantiate the four `cloudflare_dns_record` resources (requires `cloudflare_zone_id` + `cloudflare_api_token` + non-empty hostnames). |
+| `cloudflare_zone_id` | `string` | `""` | Cloudflare zone ID (not the domain name). Required when `dns_provider = "cloudflare"`. |
+| `cloudflare_api_token` | `string` (sensitive) | `""` | Cloudflare API token with Zone:Edit on the configured zone. Required when `dns_provider = "cloudflare"`. Pass via `TF_VAR_cloudflare_api_token`. |
+
+### Validation rules
+
+- `env_name`: lowercase alphanumeric with hyphens.
+- `operator_ssh_pubkeys`: ≥1 entry; every value matches
+  `^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256) AAAA`.
+- `ssh_allowed_cidrs`: ≥1 entry; every entry is a valid CIDR.
+- `server_location`: one of `nbg1`, `fsn1`, `hel1`.
+- `dns_provider`: one of `none`, `cloudflare`.
+- Cross-variable: when `dns_provider = "cloudflare"`, all of
+  `cloudflare_zone_id`, `cloudflare_api_token`, `app_hostname`,
+  `api_hostname` must be non-empty (enforced via a `precondition` on
+  `cloudflare_dns_record.app_a`).
+
+## Outputs
+
+| Name | Type | Description |
+|---|---|---|
+| `vm_ipv4` | `string` | Primary IPv4 of the env VM. Sticky across server replacement. |
+| `vm_ipv6` | `string` | Primary IPv6 of the env VM (Hetzner /64 native allocation). |
+| `ssh_command` | `string` | Ready-to-paste SSH command (`ssh deploy@<ipv4>`). |
+| `app_hostname` | `string` | Resolved SPA hostname (operator-supplied or sslip.io fallback). |
+| `api_hostname` | `string` | Resolved API hostname (operator-supplied or sslip.io fallback). |
+| `firewall_id` | `number` | Hetzner Cloud firewall ID. |
+| `server_id` | `number` | Hetzner Cloud server ID. |
+
+## Files
+
+```
+terraform/modules/${PROJECT_NAME}-env/
+├── cloud-init.yaml.tftpl   # cloud-init template (rendered by templatefile())
+├── dns.tf                  # cloudflare_dns_record × 4 (count-gated)
+├── firewall.tf             # hcloud_firewall + hcloud_firewall_attachment
+├── locals.tf               # app_hostname / api_hostname with sslip.io fallback
+├── main.tf                 # cloud-init templatefile() render
+├── outputs.tf              # exposed values
+├── README.md               # this file
+├── variables.tf            # all inputs
+├── versions.tf             # required_version + required_providers
+└── vm.tf                   # hcloud_ssh_key + hcloud_primary_ip + hcloud_server + hcloud_rdns
+```
+
+## Usage example
+
+```hcl
+# terraform/staging/main.tf (consuming root)
+module "${PROJECT_NAME_LOWER}_env" {
+  source = "../modules/${PROJECT_NAME}-env"
+
+  env_name             = "staging"
+  hcloud_token         = var.hcloud_token
+  operator_ssh_pubkeys = var.operator_ssh_pubkeys
+  ssh_allowed_cidrs    = var.ssh_allowed_cidrs
+  app_hostname         = var.app_hostname
+  api_hostname         = var.api_hostname
+
+  dns_provider         = "cloudflare"
+  cloudflare_zone_id   = var.cloudflare_zone_id
+  cloudflare_api_token = var.cloudflare_api_token
+}
+
+output "vm_ipv4" { value = module.${PROJECT_NAME_LOWER}_env.vm_ipv4 }
+output "vm_ipv6" { value = module.${PROJECT_NAME_LOWER}_env.vm_ipv6 }
+# ... etc.
+```
+
+The consuming root is also responsible for declaring `provider "hcloud" {}`
+and `provider "cloudflare" {}` blocks (with credentials read from
+`var.hcloud_token` / `var.cloudflare_api_token`) and for declaring the
+`cloud { organization = "${HCP_ORG}"; workspaces { name = "${PROJECT_NAME_LOWER}-<env>" } }`
+backend.
+
+## Lifecycle notes
+
+- **Cloud-init runs ONCE at first boot.** Re-running `terraform apply` does
+  NOT re-run cloud-init on an existing VM. To re-bootstrap, destroy and
+  re-create the server resource — `hcloud_primary_ip.app` survives because
+  `auto_delete = false`.
+- **Server-type bumps rebuild in place** (~30s downtime). The VM stays at
+  the same IPv4. Bind-mount data (`/var/lib/${PROJECT_NAME_LOWER}/db`)
+  survives the local-NVMe → local-NVMe path; `cx` → `ccx` flips storage
+  backend and is NOT safe.
+- **Hetzner Cloud Backups feature is disabled** (20% surcharge). Snapshots
+  + pg_dump backups belong to a later intent.
+- **State migration**: per-env roots use Terraform `moved {}` blocks at
+  root level when resources get renamed. The reusable module ships with
+  ZERO `moved {}` blocks — those live in the consuming root because
+  Terraform evaluates `from` addresses from the file's perspective.
+  Example: after renaming `hcloud_server.app` → `hcloud_server.web` at
+  the module level, the consumer adds:
+  ```hcl
+  # moved {
+  #   from = module.${PROJECT_NAME_LOWER}_env.hcloud_server.app
+  #   to   = module.${PROJECT_NAME_LOWER}_env.hcloud_server.web
+  # }
+  ```
+
+## Boundaries
+
+- **Provider lock-in**: Hetzner Cloud + Cloudflare. Migrating to a different
+  cloud or DNS provider is out of scope for this module.
+- **Single VM per env**: no autoscaling, no read-replicas, no separate DB
+  host. Scale-out work is per-env operator-driven via the `server_type` /
+  `server_location` knobs.
+- **No HCP workspace / GH Environment provisioning**: those are operator
+  steps documented in `docs/staging-runbook.md`.

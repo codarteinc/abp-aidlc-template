@@ -293,10 +293,6 @@ angular/src/environments/environment.local.ts
 .env.staging
 .env.*.local
 
-# Terraform working files
-terraform/staging/.terraform/
-terraform/staging/*.tfvars
-!terraform/staging/*.tfvars.example
-!terraform/staging/test/*.tfvars
-terraform/staging/*.tfstate
-terraform/staging/*.tfstate.backup
+# Terraform working files — see overlay-blocks/unit-07/gitignore-terraform.snippet
+# <ScaffoldBlock name="terraform-gitignore">
+# </ScaffoldBlock>

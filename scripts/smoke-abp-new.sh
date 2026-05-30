@@ -39,7 +39,7 @@ abp:
   optional_modules: []
 infra:
   hetzner_location: hel1
-  hetzner_server_type: cx22
+  hetzner_server_type: cx23
   cloudflare_zone: example.com
 EOF
 
@@ -258,5 +258,111 @@ if ! grep -qE '\$\{?APP_(API|WEB)_HOSTNAME\}?' "${project_root}/Caddyfile.dev"; 
 fi
 
 echo "OK: unit-06 docker-overlay surfaces present"
+
+# 7. Unit-07 terraform-overlay assertions.
+echo "--- unit-07 terraform-overlay assertions ---"
+
+# 7a. Tree shape: module + staging + staging2.example + new-terraform-env.sh.
+for path in \
+    "terraform/modules/SmokeApp-env/main.tf" \
+    "terraform/modules/SmokeApp-env/variables.tf" \
+    "terraform/modules/SmokeApp-env/dns.tf" \
+    "terraform/modules/SmokeApp-env/cloud-init.yaml.tftpl" \
+    "terraform/modules/SmokeApp-env/README.md" \
+    "terraform/staging/main.tf" \
+    "terraform/staging/versions.tf" \
+    "terraform/staging/variables.tf" \
+    "terraform/staging/outputs.tf" \
+    "terraform/staging/rebootstrap.sh" \
+    "terraform/staging/scripts/lint-cloud-init.sh" \
+    "terraform/staging/test/cloudflare.tfvars" \
+    "terraform/staging/.gitignore" \
+    "terraform/staging2.example/main.tf" \
+    "terraform/staging2.example/versions.tf" \
+    "scripts/new-terraform-env.sh" \
+    "docs/staging-runbook.md"
+do
+    if [[ ! -f "${project_root}/${path}" ]]; then
+        echo "FAIL: terraform overlay missing: ${path}" >&2
+        exit 1
+    fi
+done
+
+# 7b. Token substitution sanity — no scaffold-time tokens leftover.
+if grep -rnE '\$\{(PROJECT_NAME|PROJECTNAME_UPPER|GITHUB_OWNER|HCP_ORG|HETZNER_LOCATION|HETZNER_SERVER_TYPE|CLOUDFLARE_ZONE)' \
+        "${project_root}/terraform/" \
+        "${project_root}/scripts/new-terraform-env.sh" \
+        "${project_root}/docs/staging-runbook.md" 2>/dev/null; then
+    echo "FAIL: unsubstituted scaffold tokens in terraform overlay" >&2
+    exit 1
+fi
+
+# 7c. Resource-name substitution: hcloud_* resources carry smokeapp- prefix.
+for tf_file in \
+    "terraform/modules/SmokeApp-env/vm.tf" \
+    "terraform/modules/SmokeApp-env/firewall.tf"
+do
+    if ! grep -qE 'name *= *"smokeapp-' "${project_root}/${tf_file}"; then
+        echo "FAIL: ${tf_file} missing smokeapp- prefix in resource names" >&2
+        exit 1
+    fi
+done
+
+# 7d. HCP workspace name matches PROJECT_NAME_LOWER.
+if ! grep -q 'name = "smokeapp-staging"' "${project_root}/terraform/staging/versions.tf"; then
+    echo "FAIL: staging versions.tf missing 'name = \"smokeapp-staging\"' HCP workspace" >&2
+    exit 1
+fi
+if ! grep -q 'organization = "codarteinc"' "${project_root}/terraform/staging/versions.tf"; then
+    echo "FAIL: staging versions.tf missing 'organization = \"codarteinc\"' (HCP_ORG default-from github_owner)" >&2
+    exit 1
+fi
+
+# 7e. dns_provider default is "none".
+if ! grep -qE 'default *= *"none"' "${project_root}/terraform/modules/SmokeApp-env/variables.tf"; then
+    echo "FAIL: module variables.tf missing dns_provider default=\"none\"" >&2
+    exit 1
+fi
+
+# 7f. Scripts are executable.
+for script in \
+    "terraform/staging/rebootstrap.sh" \
+    "terraform/staging/scripts/lint-cloud-init.sh" \
+    "scripts/new-terraform-env.sh"
+do
+    if [[ ! -x "${project_root}/${script}" ]]; then
+        echo "FAIL: ${script} is not executable" >&2
+        exit 1
+    fi
+done
+
+# 7g. .gitignore carries the wildcard terraform block (post-splice).
+if ! grep -qF 'terraform/**/.terraform/' "${project_root}/.gitignore"; then
+    echo "FAIL: .gitignore missing wildcard terraform block (splice failed?)" >&2
+    exit 1
+fi
+if ! grep -qF '!terraform/**/test/*.tfvars' "${project_root}/.gitignore"; then
+    echo "FAIL: .gitignore missing test-tfvars allowlist" >&2
+    exit 1
+fi
+
+# 7h. Optional terraform fmt + validate (CLI-gated).
+if command -v terraform >/dev/null; then
+    ( cd "$project_root" && terraform fmt -check -recursive terraform/ ) \
+        || { echo "FAIL: terraform fmt -check -recursive failed" >&2; exit 1; }
+    ( cd "$project_root/terraform/modules/SmokeApp-env" && \
+        terraform init -backend=false -input=false -no-color > /dev/null && \
+        terraform validate -no-color ) \
+        || { echo "FAIL: module init+validate failed" >&2; exit 1; }
+    ( cd "$project_root/terraform/staging" && \
+        terraform init -backend=false -input=false -no-color > /dev/null && \
+        terraform validate -no-color ) \
+        || { echo "FAIL: staging init+validate failed" >&2; exit 1; }
+    echo "OK: terraform fmt + validate clean"
+else
+    echo "SKIP: terraform not on PATH; fmt+validate skipped"
+fi
+
+echo "OK: unit-07 terraform-overlay surfaces present"
 
 echo "OK: smoke test passed (solution at ${sln}; build log at ${smoke_dir}/build.log)"

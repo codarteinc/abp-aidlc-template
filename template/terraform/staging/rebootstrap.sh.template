@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# rebootstrap.sh — fast operator helper to recreate the staging VM.
+#
+# Pairs with docs/staging-runbook.md §3 (manual procedure). Use when:
+#   - cloud-init.yaml.tftpl changed and you need to apply it to the live VM
+#   - the VM is in a weird state and you want a clean re-bootstrap
+#   - you're verifying "destroy -> apply -> deploy" loops cleanly
+#
+# Default: TARGETED destroy. Only module.${PROJECT_NAME_LOWER}_env.hcloud_server.app
+# + its two dependents (hcloud_rdns.app, hcloud_firewall_attachment.app)
+# are dropped. Primary IPv4 (auto_delete=false), firewall, and SSH key
+# resources survive, so the GitHub Environment variables (STAGING_VM_IP
+# and *_HOSTNAME) stay valid and browser cert acceptance doesn't churn.
+#
+# Pass --full for a destroy of the whole module (including the primary
+# IP). You'll need to update STAGING_VM_IP and the two STAGING_*_HOSTNAME
+# repo/env variables afterward.
+#
+# Usage:
+#   ./rebootstrap.sh             # targeted destroy + apply + wait + smoke
+#   ./rebootstrap.sh --full      # full destroy + apply (loses IP)
+#   ./rebootstrap.sh -h          # this help
+#
+# Env var overrides:
+#   TF_VAR_hcloud_token                # set directly OR via sourceable file below
+#   TF_VAR_HCLOUD_TOKEN_FILE           # default: ~/.config/${PROJECT_NAME_LOWER}/staging.env
+#   ${PROJECTNAME_UPPER}_STAGING_SSH_KEY    # default: ~/.ssh/${PROJECT_NAME_LOWER}_staging
+#   SSH_TIMEOUT_SECONDS                # default: 180 (max wait for sshd to come up)
+
+set -euo pipefail
+
+# --- Args ---
+SCOPE="targeted"
+for arg in "$@"; do
+  case "$arg" in
+    --full)    SCOPE="full" ;;
+    -h|--help) sed -n '2,33p' "$0" | sed 's/^#\s\?//'; exit 0 ;;
+    *)         echo "ERROR: unknown arg: $arg" >&2; echo "Usage: $0 [--full]" >&2; exit 2 ;;
+  esac
+done
+
+# --- Anchor to script's dir (the terraform module) ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# --- Load Hetzner token: env var first, else sourceable file ---
+TF_VAR_HCLOUD_TOKEN_FILE="${TF_VAR_HCLOUD_TOKEN_FILE:-$HOME/.config/${PROJECT_NAME_LOWER}/staging.env}"
+if [[ -z "${TF_VAR_hcloud_token:-}" ]] && [[ -r "$TF_VAR_HCLOUD_TOKEN_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$TF_VAR_HCLOUD_TOKEN_FILE"
+fi
+if [[ -z "${TF_VAR_hcloud_token:-}" ]]; then
+  echo "ERROR: TF_VAR_hcloud_token is not set." >&2
+  echo "       Either export it directly or put it in $TF_VAR_HCLOUD_TOKEN_FILE" >&2
+  echo "       (see docs/staging-runbook.md §2.2)." >&2
+  exit 1
+fi
+
+# --- SSH key path ---
+SSH_KEY="${${PROJECTNAME_UPPER}_STAGING_SSH_KEY:-$HOME/.ssh/${PROJECT_NAME_LOWER}_staging}"
+if [[ ! -r "$SSH_KEY" ]]; then
+  echo "ERROR: SSH key not readable: $SSH_KEY" >&2
+  echo "       Generate per docs/staging-runbook.md §2.4 or override ${PROJECTNAME_UPPER}_STAGING_SSH_KEY." >&2
+  exit 1
+fi
+
+SSH_TIMEOUT_SECONDS="${SSH_TIMEOUT_SECONDS:-180}"
+
+# --- Phase 1: destroy ---
+echo "=== Phase 1: terraform destroy (scope=$SCOPE) ==="
+if [[ "$SCOPE" == "full" ]]; then
+  terraform destroy -auto-approve
+else
+  terraform destroy -target=module.${PROJECT_NAME_LOWER}_env.hcloud_server.app -auto-approve
+fi
+
+# --- Phase 2: apply ---
+echo
+echo "=== Phase 2: terraform apply ==="
+terraform apply -auto-approve
+
+VM_IP=$(terraform output -raw vm_ipv4)
+echo
+echo "VM IPv4: $VM_IP"
+ssh-keygen -R "$VM_IP" >/dev/null 2>&1 || true
+
+# --- Phase 3: wait for SSH ---
+echo
+echo "=== Phase 3: wait for SSH (up to ${SSH_TIMEOUT_SECONDS}s) ==="
+START=$(date +%s)
+until ssh -4 -i "$SSH_KEY" \
+        -o StrictHostKeyChecking=accept-new \
+        -o ConnectTimeout=5 \
+        -o BatchMode=yes \
+        deploy@"$VM_IP" 'echo ssh-up' >/dev/null 2>&1; do
+  elapsed=$(($(date +%s) - START))
+  if [[ "$elapsed" -gt "$SSH_TIMEOUT_SECONDS" ]]; then
+    echo "ERROR: SSH not up after ${SSH_TIMEOUT_SECONDS}s. Verbose attempt:" >&2
+    ssh -4 -i "$SSH_KEY" -v -o ConnectTimeout=5 deploy@"$VM_IP" 'echo ok' 2>&1 | tail -10 >&2
+    exit 1
+  fi
+  sleep 5
+done
+echo "SSH up after $(($(date +%s) - START))s"
+
+# --- Phase 4: cloud-init ---
+echo
+echo "=== Phase 4: cloud-init status --wait ==="
+CI_START=$(date +%s)
+ssh -4 -i "$SSH_KEY" deploy@"$VM_IP" 'cloud-init status --wait'
+echo "cloud-init done in $(($(date +%s) - CI_START))s"
+
+# --- Phase 5: smoke test (matches docs/staging-runbook.md §3.3) ---
+echo
+echo "=== Phase 5: smoke test ==="
+ssh -4 -i "$SSH_KEY" deploy@"$VM_IP" '
+  set -e
+  echo "  docker:            $(docker --version | awk "{print \$3}" | tr -d ,)"
+  stat -c "  postgres data dir: %a uid=%u gid=%g (expect 700 uid=70 gid=70)" /var/lib/${PROJECT_NAME_LOWER}/db
+  stat -c "  secrets dir:       %a %U:%G (expect 750 root:deploy)" /etc/${PROJECT_NAME_LOWER}/api
+  if test -f /var/lib/${PROJECT_NAME_LOWER}/.bootstrap-complete; then
+    echo "  bootstrap marker:  OK"
+  else
+    echo "  bootstrap marker:  MISSING" >&2
+    exit 1
+  fi
+'
+
+# --- Done ---
+echo
+echo "============================================================"
+echo "VM is ready at $VM_IP"
+echo "============================================================"
+cat <<EOF
+
+Next step - deploy from GitHub:
+  Actions -> Staging Deploy -> Run workflow -> leave inputs empty -> Run
+  Or via CLI:
+    gh workflow run staging-deploy.yml --repo ${GITHUB_OWNER}/${PROJECT_NAME_LOWER} --ref main
+
+EOF
+if [[ "$SCOPE" == "full" ]]; then
+  cat <<EOF
+WARNING: --full destroyed the primary IP. The new IP is $VM_IP.
+  Update repo/env variables before deploying:
+    STAGING_VM_IP         = $VM_IP
+    STAGING_API_HOSTNAME  = api.\$(echo "$VM_IP" | tr . -).sslip.io
+    STAGING_WEB_HOSTNAME  = app.\$(echo "$VM_IP" | tr . -).sslip.io
+  See docs/staging-runbook.md §3.3.
+
+EOF
+fi

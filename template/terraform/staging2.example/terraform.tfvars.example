@@ -1,0 +1,32 @@
+# terraform.tfvars.example — copy to terraform.tfvars (gitignored) and fill in.
+#
+# IMPORTANT: do NOT put secrets in this file. The `hcloud_token` and
+# `cloudflare_api_token` variables read from `TF_VAR_hcloud_token` /
+# `TF_VAR_cloudflare_api_token` env vars on the apply host.
+#
+# Quick start:
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#   # edit terraform.tfvars (set ssh_allowed_cidrs + operator_ssh_pubkeys)
+#   export TF_VAR_hcloud_token="hetzner-api-token-from-console"
+#   terraform init
+#   terraform plan
+#   terraform apply
+
+# REQUIRED — list of CIDR blocks allowed to SSH into the VM.
+# Use /32 for single IPs. Get yours from: curl -4 ifconfig.me
+ssh_allowed_cidrs = [
+  # "203.0.113.7/32",     # operator-1 home
+]
+
+# REQUIRED — operator SSH public keys keyed by a stable short name.
+operator_ssh_pubkeys = {
+  # "alice-laptop" = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop"
+}
+
+# OPTIONAL — DNS provider. Default is "none" (sslip.io fallback). Flip to
+# "cloudflare" once you've created the zone records.
+# dns_provider       = "cloudflare"
+# cloudflare_zone_id = "0123456789abcdef0123456789abcdef"
+# app_hostname       = "app.staging2.example.com"
+# api_hostname       = "api.staging2.example.com"

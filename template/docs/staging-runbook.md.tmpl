@@ -1,0 +1,438 @@
+# ${PROJECT_NAME} Staging Runbook
+
+Operator guide for the Hetzner Cloud staging environment provisioned by
+`terraform/staging/`. Covers first-time setup, day-2 procedures (SSH/IP
+rotation, Cloudflare flip), and the troubleshooting catalogue.
+
+> Deploy + rollback procedures land in this runbook once unit-08 wires
+> the GitHub Actions workflows. Until then, treat the deploy / rollback
+> sections as pointers — they reference future workflows by filename.
+
+---
+
+## 1. Architecture overview
+
+```
+                ┌──────────────────────────────┐
+                │ Cloudflare DNS (optional)    │
+                │ app.staging.${CLOUDFLARE_ZONE}        │
+                │ api.staging.${CLOUDFLARE_ZONE}        │
+                └────────────┬─────────────────┘
+                             │ A / AAAA
+                             ▼
+       ┌─────────────────────────────────────────┐
+       │ Hetzner Cloud VM (${HETZNER_LOCATION} / ${HETZNER_SERVER_TYPE})         │
+       │  ┌─────────────────────────────────────┐│
+       │  │ Caddy (reverse proxy + ACME TLS)    ││
+       │  └────────┬──────────────────┬─────────┘│
+       │           │                  │          │
+       │  ┌────────▼───────┐ ┌────────▼────────┐│
+       │  │ api (HttpApi)  │ │ web (nginx+SPA) ││
+       │  └────────┬───────┘ └─────────────────┘│
+       │           │                             │
+       │  ┌────────▼────────┐                    │
+       │  │ db (postgres)   │                    │
+       │  └─────────────────┘                    │
+       │                                         │
+       │  /etc/${PROJECT_NAME_LOWER}/{api,migrator}   ← secrets │
+       │  /var/lib/${PROJECT_NAME_LOWER}/db           ← pg data │
+       │  /var/lib/${PROJECT_NAME_LOWER}/.bootstrap-complete   │
+       └─────────────────────────────────────────┘
+```
+
+- **Terraform** (`terraform/staging/`) provisions the VM + firewall + sticky
+  IPv4 + optional Cloudflare DNS records via the shared module
+  `terraform/modules/${PROJECT_NAME}-env/`.
+- **cloud-init** bootstraps the VM at first boot: installs Docker engine
+  + compose plugin, creates the `deploy` user with scoped sudoers, lays
+  down the load-bearing directory tree.
+- **GitHub Actions** (lands in unit-08) deploys docker images from GHCR to
+  the VM via SSH, then runs `docker compose up -d` against the rendered
+  `docker-compose.yml` + `docker-compose.staging.yml` overlay.
+- **State** lives in HCP Terraform workspace `${PROJECT_NAME_LOWER}-staging`
+  (Execution Mode = Local).
+
+---
+
+## 2. First-time setup (one-time per project)
+
+### 2.1 Accounts you need
+
+- **Hetzner Cloud** — https://accounts.hetzner.com/ (free signup; pay-as-
+  you-go, ~€4/mo for a cx23 + IPv4).
+- **HCP Terraform** — https://app.terraform.io/ (free tier is fine; we
+  use it for state-only).
+- **GitHub** — repo at `${GITHUB_OWNER}/${PROJECT_NAME_LOWER}`.
+- **Cloudflare** — *optional*. The default `dns_provider = "none"` uses
+  sslip.io and needs no DNS provider. Switch to `cloudflare` (§7) once
+  you've got a real zone.
+
+### 2.2 Generate the Hetzner API token
+
+1. Hetzner Cloud Console → your project → Security → API Tokens.
+2. **Generate API Token** → Description `${PROJECT_NAME_LOWER}-staging-tf`,
+   Permissions: **Read & Write**, Save.
+3. Copy the token (shown once). Stash it in a sourceable file:
+
+   ```bash
+   mkdir -p ~/.config/${PROJECT_NAME_LOWER}
+   cat > ~/.config/${PROJECT_NAME_LOWER}/staging.env <<EOF
+   export TF_VAR_hcloud_token="hetzner-api-token-from-console"
+   EOF
+   chmod 600 ~/.config/${PROJECT_NAME_LOWER}/staging.env
+   ```
+
+4. `rebootstrap.sh` and any new shell will pick this up automatically.
+
+### 2.3 Create the HCP Terraform workspace
+
+**This is the load-bearing step.** Without `execution_mode = local`,
+every `terraform apply` fails with "no providers configured" (HCP runs
+on its own runners that don't have your Hetzner / Cloudflare tokens).
+
+1. https://app.terraform.io/ → sign in.
+2. Pick / create the org **`${HCP_ORG}`**. (Default: same name as
+   `${GITHUB_OWNER}`. Operator can override via `hcp_org` in
+   `scaffold-config.yml`.)
+3. **Create workspace** → **CLI-driven workflow** → name =
+   **`${PROJECT_NAME_LOWER}-staging`**.
+4. **Settings → Execution Mode → Local → Save.** *(This is THE checklist
+   item. Without it every apply will fail.)*
+5. Generate an API token: choose one path:
+   - **Browser flow** (recommended):
+     `terraform login` → opens browser → token gets written to
+     `~/.terraform.d/credentials.tfrc.json` (mode 0600).
+   - **Manual**: HCP → User Settings → Tokens → Create →
+     `export TF_TOKEN_app_terraform_io=<token>` in your shell rc.
+6. From the repo root:
+
+   ```bash
+   cd terraform/staging
+   terraform init   # pulls the providers + wires the HCP backend
+   ```
+
+### 2.4 Generate the SSH key + collect allowlist IPs
+
+1. Generate a dedicated key (you don't want your daily-driver key on the
+   server inventory):
+
+   ```bash
+   ssh-keygen -t ed25519 -C "${PROJECT_NAME_LOWER}-staging-operator" \
+              -f ~/.ssh/${PROJECT_NAME_LOWER}_staging -N ""
+   ```
+
+2. Capture the pubkey:
+
+   ```bash
+   cat ~/.ssh/${PROJECT_NAME_LOWER}_staging.pub
+   ```
+
+   You'll paste this into `operator_ssh_pubkeys` in
+   `terraform/staging/terraform.tfvars`.
+
+3. Get your public IP for `ssh_allowed_cidrs`:
+
+   ```bash
+   curl -4 ifconfig.me   # → 203.0.113.7
+   # CIDR form: 203.0.113.7/32
+   ```
+
+### 2.5 Install Terraform + lint tools
+
+```bash
+# Terraform — https://developer.hashicorp.com/terraform/install
+sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+sudo apt-get update && sudo apt-get install -y terraform   # >= 1.10
+
+# Shellcheck + python yaml for the cloud-init linter
+sudo apt-get install -y shellcheck python3-yaml
+```
+
+### 2.6 Wiring Cloudflare (optional — `dns_provider = "cloudflare"`)
+
+The default `dns_provider = "none"` uses sslip.io so the first apply
+needs zero DNS setup — `terraform output -raw spa_hostname` returns
+`app.5-75-123-45.sslip.io` and certs auto-provision via Caddy. See §7
+for the flip procedure when you're ready for a real zone.
+
+---
+
+## 3. Provisioning the VM
+
+### 3.1 First apply
+
+```bash
+cd terraform/staging
+
+# 1. Copy the tfvars template and fill in.
+cp terraform.tfvars.example terraform.tfvars
+# edit terraform.tfvars:
+#   ssh_allowed_cidrs    = ["203.0.113.7/32"]
+#   operator_ssh_pubkeys = { "alice-laptop" = "ssh-ed25519 AAAA... alice@laptop" }
+
+# 2. Load the Hetzner token (set in §2.2).
+source ~/.config/${PROJECT_NAME_LOWER}/staging.env
+
+# 3. Plan + apply.
+terraform plan
+terraform apply
+```
+
+Expected output:
+
+```
+hcloud_ssh_key.operators["alice-laptop"]: Creation complete after 1s
+hcloud_primary_ip.app: Creation complete after 2s [id=…]
+hcloud_firewall.app: Creation complete after 1s [id=…]
+hcloud_server.app: Creating...
+hcloud_server.app: Creation complete after 24s [id=…]
+hcloud_firewall_attachment.app: Creation complete after 1s
+hcloud_rdns.app: Creation complete after 1s
+
+Outputs:
+api_hostname = "api.5-75-123-45.sslip.io"
+spa_hostname = "app.5-75-123-45.sslip.io"
+ssh_command  = "ssh deploy@5.75.123.45"
+vm_ipv4      = "5.75.123.45"
+vm_ipv6      = "2a01:…"
+```
+
+### 3.2 Wait for cloud-init
+
+Cloud-init runs in the background after Hetzner's "server created"
+moment. Wait for it before you ssh in for any other reason:
+
+```bash
+ssh -i ~/.ssh/${PROJECT_NAME_LOWER}_staging deploy@$(terraform output -raw vm_ipv4) 'cloud-init status --wait'
+```
+
+Expected: `status: done` after ~3-5 minutes. If it never converges, see
+§8.1 troubleshooting.
+
+### 3.3 Verify the VM is ready
+
+```bash
+ssh -i ~/.ssh/${PROJECT_NAME_LOWER}_staging deploy@$(terraform output -raw vm_ipv4) '
+  set -e
+  echo "docker:           $(docker --version | awk "{print \$3}" | tr -d ,)"
+  stat -c "postgres dir:    %a uid=%u gid=%g (expect 700 70 70)" /var/lib/${PROJECT_NAME_LOWER}/db
+  stat -c "secrets dir:     %a %U:%G (expect 750 root:deploy)" /etc/${PROJECT_NAME_LOWER}/api
+  test -f /var/lib/${PROJECT_NAME_LOWER}/.bootstrap-complete && echo "bootstrap marker: OK"
+'
+```
+
+All four checks must pass. If postgres dir is `0755 0 0`, the cloud-init
+ran an old version — re-bootstrap (`./rebootstrap.sh --full`).
+
+The faster wrapper:
+
+```bash
+./rebootstrap.sh        # targeted destroy + apply + wait + smoke test
+./rebootstrap.sh --full # full destroy (drops the primary IP — last resort)
+```
+
+---
+
+## 4. Deploy
+
+When unit-08 lands, `gh workflow run staging-deploy.yml --repo
+${GITHUB_OWNER}/${PROJECT_NAME_LOWER}` will deploy the latest `main` build to
+the VM. Until then, the manual procedure is:
+
+```bash
+ssh -i ~/.ssh/${PROJECT_NAME_LOWER}_staging deploy@$(terraform output -raw vm_ipv4)
+# on the VM:
+cd /opt/${PROJECT_NAME_LOWER}     # operator-managed working dir
+docker compose -f docker-compose.yml -f docker-compose.staging.yml pull
+docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+```
+
+See unit-08's `staging-deploy.yml` for the canonical procedure once it
+exists.
+
+---
+
+## 5. Rollback
+
+unit-08 ships `staging-rollback.yml` for one-click per-service rollback.
+Until then, the manual procedure is to flip the image tag in the
+compose-overlay env vars and re-run `docker compose up -d`:
+
+```bash
+API_VERSION=v1.2.2 WEB_VERSION=v1.2.2 MIGRATOR_VERSION=v1.2.2 \
+  docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+```
+
+> Schema rollback is delicate: if the new release included migrations,
+> rolling the API back without also rolling back the DB schema can fail.
+> Confirm schema-compat before rolling back the migrator.
+
+---
+
+## 6. SSH access and IP rotation
+
+### Add a new operator pubkey
+
+1. Append a new entry to `operator_ssh_pubkeys` in
+   `terraform/staging/terraform.tfvars`:
+
+   ```hcl
+   operator_ssh_pubkeys = {
+     "alice-laptop" = "ssh-ed25519 AAAA... alice@laptop"
+     "bob-laptop"   = "ssh-ed25519 AAAA... bob@laptop"   # ← new
+   }
+   ```
+
+2. `terraform plan` should show `+ hcloud_ssh_key.operators["bob-laptop"]`
+   only (no server replacement).
+3. `terraform apply`.
+
+The new key gets injected into `/root/.ssh/authorized_keys` by Hetzner
+but the load-bearing pubkey list is in cloud-init's `users:` block —
+which only runs at first boot. To get the new key into
+`/home/deploy/.ssh/authorized_keys` on the live VM, append it manually:
+
+```bash
+ssh deploy@<vm_ipv4> 'echo "ssh-ed25519 AAAA... bob@laptop" >> ~/.ssh/authorized_keys'
+```
+
+(Or `./rebootstrap.sh` if you want everything reset clean.)
+
+### Rotate `ssh_allowed_cidrs`
+
+Operator moved to a new ISP, new IP. Edit `terraform.tfvars`:
+
+```hcl
+ssh_allowed_cidrs = ["198.51.100.42/32"]   # new home IP
+```
+
+`terraform plan` shows `~ hcloud_firewall.app` (in-place update). Apply,
+done — no VM downtime.
+
+---
+
+## 7. Cloudflare flip (`none` → `cloudflare`)
+
+When you're ready to retire the sslip.io URLs and use a real domain:
+
+1. Pick a zone you control in Cloudflare and grab its **Zone ID**
+   (Overview → API → Zone ID).
+2. Create a scoped API token (Zone:Edit on that zone): Cloudflare →
+   My Profile → API Tokens → Create Token → "Edit zone DNS" template →
+   scope to that zone.
+3. Edit `terraform/staging/terraform.tfvars`:
+
+   ```hcl
+   dns_provider       = "cloudflare"
+   cloudflare_zone_id = "0123456789abcdef0123456789abcdef"
+   app_hostname       = "app.staging.${CLOUDFLARE_ZONE}"
+   api_hostname       = "api.staging.${CLOUDFLARE_ZONE}"
+   ```
+
+4. Export the token + apply:
+
+   ```bash
+   export TF_VAR_cloudflare_api_token="cloudflare-zone-edit-token"
+   terraform plan
+   terraform apply
+   ```
+
+   You should see `+ cloudflare_dns_record.app_a` (and three friends)
+   created — no VM churn.
+
+5. Wait ~5 min for DNS to propagate. Visit `https://app.staging.${CLOUDFLARE_ZONE}`
+   — Caddy auto-provisions a Let's Encrypt cert.
+
+If you want to roll back to sslip.io: set `dns_provider = "none"` and
+apply. Cloudflare records get destroyed; the VM keeps serving on its
+sslip.io fallback.
+
+---
+
+## 8. Troubleshooting
+
+### 8.1 Cloud-init didn't converge
+
+`cloud-init status --wait` returns `status: error` or hangs. Inspect:
+
+```bash
+ssh deploy@<vm_ipv4> 'sudo cloud-init status --long'
+ssh deploy@<vm_ipv4> 'sudo journalctl -u cloud-final --no-pager | tail -50'
+```
+
+Common causes:
+
+- **apt mirror flake.** Re-bootstrap with `./rebootstrap.sh` — Hetzner
+  cycles the apt mirror used by each VM.
+- **Docker apt repo gone.** The `noble` repo pin is sometimes lagged.
+  Edit `terraform/modules/${PROJECT_NAME}-env/cloud-init.yaml.tftpl`,
+  bump the Docker pin to the current `apt-cache madison docker-ce`
+  output, and re-bootstrap.
+
+### 8.2 HCP Terraform workspace missing / `terraform init` returns 403
+
+The workspace name in `versions.tf`'s `cloud {}` block must match the
+HCP UI exactly. Re-check `${PROJECT_NAME_LOWER}-staging`. If HCP returns
+403, confirm `terraform login` ran on this machine and there's a
+`credentials.tfrc.json` at `~/.terraform.d/`.
+
+### 8.3 Postgres won't start — `permission denied` on data dir
+
+The bind-mount target `/var/lib/${PROJECT_NAME_LOWER}/db` MUST be owned
+UID 70 / GID 70 (`postgres:17-alpine`). If it's `999:999`, cloud-init
+ran an old version. Fix in place:
+
+```bash
+ssh deploy@<vm_ipv4> 'sudo chown -R 70:70 /var/lib/${PROJECT_NAME_LOWER}/db && sudo chmod 0700 /var/lib/${PROJECT_NAME_LOWER}/db'
+docker compose -f docker-compose.yml -f docker-compose.staging.yml restart db
+```
+
+Or re-bootstrap (`./rebootstrap.sh --full`).
+
+### 8.4 Browser says cert is for `app.localhost`
+
+You're connecting to the sslip.io URL but Caddy is still serving the
+dev cert. Cause: `APP_ENVIRONMENT` env var is `Development` on the VM.
+Confirm the staging compose overlay is wired:
+
+```bash
+ssh deploy@<vm_ipv4> 'docker compose -f docker-compose.yml -f docker-compose.staging.yml config | grep -A1 APP_ENVIRONMENT'
+```
+
+Should print `APP_ENVIRONMENT: Staging`. If it says `Development`, the
+overlay wasn't passed — relaunch with the `-f docker-compose.staging.yml`
+flag.
+
+### 8.5 `terraform plan` parses `terraform.tfvars` incorrectly
+
+If you accidentally drop a closing brace in `operator_ssh_pubkeys`, the
+parse error is cryptic. Run:
+
+```bash
+terraform fmt terraform.tfvars
+```
+
+This is the fastest way to surface a bracket-mismatch.
+
+### 8.6 Stale Terraform state lock
+
+HCP holds a lock during `apply`. If the process was killed mid-apply,
+the lock survives. Clear it:
+
+```bash
+# Get the lock ID from the error message.
+terraform force-unlock <lock-id>
+```
+
+Or via HCP UI: workspace → Settings → Locking → Force unlock.
+
+---
+
+## Useful references
+
+- Hetzner Cloud API docs: https://docs.hetzner.cloud/
+- HCP Terraform: https://app.terraform.io/
+- Cloudflare DNS records v5 provider: https://registry.terraform.io/providers/cloudflare/cloudflare/latest/docs/resources/dns_record
+- Project README: [`../README.md`](../README.md)
+- Terraform module README: [`../terraform/modules/${PROJECT_NAME}-env/README.md`](../terraform/modules/${PROJECT_NAME}-env/README.md)

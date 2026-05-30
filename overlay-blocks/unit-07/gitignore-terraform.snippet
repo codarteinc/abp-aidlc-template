@@ -1,0 +1,10 @@
+# Terraform working files (every env)
+terraform/**/.terraform/
+terraform/**/*.tfvars
+!terraform/**/*.tfvars.example
+# Scratch validate-only tfvars under test/ are committed (no secrets, fake values for `terraform validate`).
+!terraform/**/test/*.tfvars
+terraform/**/*.tfstate
+terraform/**/*.tfstate.backup
+terraform/**/crash.log
+# Note: .terraform.lock.hcl IS committed (Terraform best practice — pins provider versions).

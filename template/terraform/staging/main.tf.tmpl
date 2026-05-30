@@ -1,0 +1,44 @@
+# Staging root module — thin consumer of `../modules/${PROJECT_NAME}-env`.
+#
+# Owns:
+#   1. Provider configuration (credentials read from var.* so secrets enter via
+#      TF_VAR_* env vars and never land in a committed tfvars).
+#   2. The single `module "${PROJECT_NAME_LOWER}_env"` instantiation for the
+#      staging env.
+#
+# Resource definitions, locals, and cloud-init live in the shared module.
+# Unlike LinkHub's staging root, this scaffold has no pre-refactor flat state
+# to migrate from — `moved {}` blocks live in this directory only when YOU
+# rename / restructure resources after the first apply (see the module
+# README's "Lifecycle notes" for the worked example).
+#
+# Cloudflare token validation: Cloudflare v5.19+ regex-validates `api_token`
+# and rejects "". The ternary below normalises "" → null, which the provider
+# treats as "no auth configured". Safe because every `cloudflare_dns_record`
+# in the module is `count`-gated on `var.dns_provider == "cloudflare"` and no
+# Cloudflare API calls happen in the default `dns_provider = "none"` case.
+
+provider "hcloud" {
+  token = var.hcloud_token
+}
+
+provider "cloudflare" {
+  api_token = var.cloudflare_api_token != "" ? var.cloudflare_api_token : null
+}
+
+module "${PROJECT_NAME_LOWER}_env" {
+  source = "../modules/${PROJECT_NAME}-env"
+
+  env_name             = "staging"
+  hcloud_token         = var.hcloud_token
+  operator_ssh_pubkeys = var.operator_ssh_pubkeys
+  ssh_allowed_cidrs    = var.ssh_allowed_cidrs
+  app_hostname         = var.app_hostname
+  api_hostname         = var.api_hostname
+  server_type          = var.server_type
+  server_location      = var.server_location
+  server_image         = var.server_image
+  dns_provider         = var.dns_provider
+  cloudflare_zone_id   = var.cloudflare_zone_id
+  cloudflare_api_token = var.cloudflare_api_token
+}

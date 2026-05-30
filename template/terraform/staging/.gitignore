@@ -1,0 +1,9 @@
+.terraform/
+*.tfvars
+!*.tfvars.example
+# Scratch validate-only tfvars under test/ are committed (they contain no
+# secrets, only fake-but-syntactically-valid values for `terraform validate`).
+!test/*.tfvars
+*.tfstate
+*.tfstate.backup
+crash.log

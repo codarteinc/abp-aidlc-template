@@ -1,0 +1,53 @@
+# terraform/staging2.example — second-env example consumer
+
+Thin root module that instantiates the shared
+[`terraform/modules/${PROJECT_NAME}-env`](../modules/${PROJECT_NAME}-env/README.md)
+module with a second env's variable values. This directory is **the
+canonical "any additional env starts here" example**.
+
+## Why `.example` in the name
+
+The `.example` suffix marks this directory as a copy-as-new-env starting
+point — NOT a real env you should `terraform init` against. Doing so
+would attempt to bind to an HCP workspace named
+`${PROJECT_NAME_LOWER}-staging2` that you probably haven't created.
+
+To bring up a real second environment:
+
+```bash
+# Preferred: use the helper (validates env-name, rewrites workspace + env_name).
+./scripts/new-terraform-env.sh production       # creates terraform/production/
+
+# Manual:
+cp -r terraform/staging2.example terraform/production
+# edit terraform/production/main.tf      — replace env_name = "staging2" with "production"
+# edit terraform/production/versions.tf  — replace name = "${PROJECT_NAME_LOWER}-staging2"
+#                                          with "${PROJECT_NAME_LOWER}-production"
+```
+
+After cloning, the operator next steps mirror `terraform/staging/`'s
+README — create the HCP workspace (Execution Mode = Local), fill in
+`terraform.tfvars`, `terraform init`, `terraform plan`, `terraform apply`.
+
+## What's intentionally missing
+
+- **No `moved.tf`.** Fresh envs have no pre-refactor state to migrate.
+  Add `moved {}` blocks only when YOU rename / restructure resources
+  after the first apply (see the module README's "Lifecycle notes").
+- **No `rebootstrap.sh`.** Copy from `terraform/staging/rebootstrap.sh`
+  and rewrite the `module.${PROJECT_NAME_LOWER}_env.*` references for
+  the new env if you want it. The helper script lives in staging only
+  so this example tree stays minimal.
+
+## Files
+
+```
+terraform/staging2.example/
+├── main.tf            # provider blocks + module instantiation (env_name = "staging2")
+├── variables.tf       # operator-facing knobs (mirrors staging/)
+├── outputs.tf         # forwarded module outputs (mirrors staging/)
+├── versions.tf        # required_version + required_providers + cloud {} backend
+└── terraform.tfvars.example
+```
+
+Full operator guide: [`docs/staging-runbook.md`](../../docs/staging-runbook.md).

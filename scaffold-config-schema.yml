@@ -89,8 +89,8 @@ infra:
     hetzner_server_type:
       type: string
       required: false
-      default: cx22
-      description: "Hetzner Cloud server type for staging."
+      default: cx23
+      description: "Hetzner Cloud server type for staging. (cx22 was retired by Hetzner in 2026; cx23 is its successor.)"
     cloudflare_zone:
       type: string
       required: true

@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# scripts/new-terraform-env.sh — clone terraform/staging/ to a new env.
+#
+# Use this when you want a second (or third, fourth) ${PROJECT_NAME}
+# environment: production, staging2, edge-eu, etc. The script copies the
+# staging/ tree, rewrites the HCP workspace name + env_name in the
+# rendered HCL, and prints the operator next-steps banner.
+#
+# Why not parameterize via tfvars? The HCP workspace name lives in
+# versions.tf's `cloud {}` block, which Terraform forbids from
+# variable interpolation (provisioning-time vs run-time chicken-and-egg).
+# Same for `env_name` in main.tf's `module "..." { ... }` block. Both are
+# literal strings that must be sed-substituted when cloning the directory.
+#
+# Usage:
+#   scripts/new-terraform-env.sh <env-name> [--dry-run]
+#
+# Examples:
+#   scripts/new-terraform-env.sh production
+#   scripts/new-terraform-env.sh production --dry-run
+#   scripts/new-terraform-env.sh staging2
+#
+# Validation:
+#   - <env-name> must match `^[a-z0-9][a-z0-9-]*$` (same regex as
+#     var.env_name validation in the module).
+#   - Must run from a checkout of the scaffolded repo (detects
+#     terraform/staging/ existence, fails otherwise).
+#
+# Exit codes:
+#   0  success
+#   1  invalid env-name OR missing terraform/staging/
+#   2  destination already exists
+
+set -euo pipefail
+
+# --- Args -----------------------------------------------------------------
+DRY_RUN=0
+ENV_NAME=""
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help)
+      sed -n '2,30p' "$0" | sed 's/^#\s\?//'
+      exit 0
+      ;;
+    --*)
+      echo "ERROR: unknown flag: $arg" >&2
+      exit 1
+      ;;
+    *)
+      if [[ -z "$ENV_NAME" ]]; then
+        ENV_NAME="$arg"
+      else
+        echo "ERROR: too many positional args (got '$ENV_NAME' and '$arg')" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$ENV_NAME" ]]; then
+  echo "ERROR: env-name is required." >&2
+  echo "Usage: $0 <env-name> [--dry-run]" >&2
+  exit 1
+fi
+
+# --- Validate env-name (mirror module validation) ------------------------
+if ! [[ "$ENV_NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+  echo "ERROR: env-name must match '^[a-z0-9][a-z0-9-]*\$' (lowercase alphanumeric + hyphens, starting with letter or digit)." >&2
+  echo "       got: '$ENV_NAME'" >&2
+  exit 1
+fi
+
+# --- Anchor: must run from scaffolded repo root --------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+if [[ ! -d "${REPO_ROOT}/terraform/staging" ]]; then
+  echo "ERROR: ${REPO_ROOT}/terraform/staging/ not found." >&2
+  echo "       This script must run from a checkout of the scaffolded ${PROJECT_NAME} repo." >&2
+  exit 1
+fi
+
+SRC="${REPO_ROOT}/terraform/staging"
+DST="${REPO_ROOT}/terraform/${ENV_NAME}"
+
+# --- Idempotency: refuse to overwrite ------------------------------------
+if [[ -e "$DST" ]]; then
+  echo "ERROR: ${DST} already exists. Remove it first if you really want to recreate." >&2
+  exit 2
+fi
+
+# --- Plan the edits ------------------------------------------------------
+OLD_WORKSPACE="name = \"${PROJECT_NAME_LOWER}-staging\""
+NEW_WORKSPACE="name = \"${PROJECT_NAME_LOWER}-${ENV_NAME}\""
+OLD_ENV='env_name             = "staging"'
+NEW_ENV="env_name             = \"${ENV_NAME}\""
+
+echo "=== new-terraform-env: ${ENV_NAME} ==="
+echo "  source:      ${SRC#"$REPO_ROOT"/}"
+echo "  destination: ${DST#"$REPO_ROOT"/}"
+echo "  workspace name: ${OLD_WORKSPACE}  ->  ${NEW_WORKSPACE}"
+echo "  env_name:       ${OLD_ENV}  ->  ${NEW_ENV}"
+
+if (( DRY_RUN == 1 )); then
+  echo
+  echo "--- dry-run (no files written) ---"
+  echo "  cp -r terraform/staging terraform/${ENV_NAME}"
+  echo "  rm -rf terraform/${ENV_NAME}/.terraform terraform/${ENV_NAME}/*.tfstate*"
+  echo "  rm -f  terraform/${ENV_NAME}/terraform.tfvars terraform/${ENV_NAME}/moved.tf"
+  echo "  sed -i 's|${OLD_WORKSPACE}|${NEW_WORKSPACE}|' terraform/${ENV_NAME}/versions.tf"
+  echo "  sed -i 's|${OLD_ENV}|${NEW_ENV}|' terraform/${ENV_NAME}/main.tf"
+  exit 0
+fi
+
+# --- Phase 1: clone the tree ---------------------------------------------
+echo
+echo "--- cloning ---"
+cp -r "$SRC" "$DST"
+
+# --- Phase 2: clean up state + secrets that shouldn't carry across -------
+# .terraform/ has provider binaries + .terraform.lock.hcl tied to staging.
+# .tfstate / .tfstate.backup are local state caches; the real state lives
+# in HCP. terraform.tfvars often contains operator secrets / IPs.
+# moved.tf shouldn't exist in a fresh env (defensive — staging may add one
+# later if resources get renamed).
+rm -rf "$DST/.terraform"
+find "$DST" -maxdepth 2 -name '*.tfstate' -delete
+find "$DST" -maxdepth 2 -name '*.tfstate.backup' -delete
+rm -f "$DST/terraform.tfvars"
+rm -f "$DST/moved.tf"
+
+# --- Phase 3: rewrite the HCP workspace name -----------------------------
+sed -i "s|${OLD_WORKSPACE}|${NEW_WORKSPACE}|" "$DST/versions.tf"
+
+# --- Phase 4: rewrite the env_name ---------------------------------------
+sed -i "s|${OLD_ENV}|${NEW_ENV}|" "$DST/main.tf"
+
+# --- Operator next steps -------------------------------------------------
+cat <<EOF
+
+=== done ===
+
+Next steps:
+
+  1. Create the HCP Terraform workspace '${PROJECT_NAME_LOWER}-${ENV_NAME}'
+     under the '${HCP_ORG}' org. Execution Mode = Local.
+     (See docs/staging-runbook.md §2.3.)
+
+  2. Fill in the new tfvars:
+       cd terraform/${ENV_NAME}
+       cp terraform.tfvars.example terraform.tfvars
+       # edit terraform.tfvars (ssh_allowed_cidrs + operator_ssh_pubkeys)
+       export TF_VAR_hcloud_token=\"hetzner-api-token-from-console\"
+
+  3. Bring up the env:
+       terraform init
+       terraform plan
+       terraform apply
+
+EOF

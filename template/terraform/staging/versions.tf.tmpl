@@ -1,0 +1,32 @@
+terraform {
+  required_version = "~> 1.10"
+
+  required_providers {
+    hcloud = {
+      source  = "hetznercloud/hcloud"
+      version = "~> 1.63"
+    }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 5.0"
+    }
+  }
+
+  # HCP Terraform (Terraform Cloud) remote state + locking. Set
+  # `execution_mode = local` in the HCP workspace UI BEFORE the first
+  # `terraform init` — without it, HCP tries to run apply on its own
+  # runners and fails (no Hetzner / Cloudflare tokens there). This is
+  # the #1 operator pitfall; see docs/staging-runbook.md §2.3.
+  #
+  # Operator: if your HCP organization slug differs from `${HCP_ORG}`,
+  # edit `organization` accordingly. The workspace name
+  # `${PROJECT_NAME_LOWER}-staging` is a soft default — change to match
+  # what you create in the HCP web UI.
+  cloud {
+    organization = "${HCP_ORG}"
+
+    workspaces {
+      name = "${PROJECT_NAME_LOWER}-staging"
+    }
+  }
+}

@@ -38,11 +38,12 @@ source "${LIB_DIR}/prompt.sh"
 source "${LIB_DIR}/substitute.sh"
 
 # Total number of orchestration phases. Bump as unit-10 adds real bodies.
-# 13 includes unit-05's phase_apply_security_overlay (inserted between
-# phase_apply_overlays and phase_run_post_init_commands) and unit-06's
+# 14 includes unit-05's phase_apply_security_overlay (inserted between
+# phase_apply_overlays and phase_run_post_init_commands), unit-06's
 # phase_apply_docker_overlay (inserted between security overlay and
-# post-init).
-STEP_TOTAL=13
+# post-init), and unit-07's phase_apply_terraform_overlay (inserted
+# between docker overlay and post-init).
+STEP_TOTAL=14
 STEP=0
 CURRENT_PHASE=""
 
@@ -155,7 +156,7 @@ _export_config_env() {
     MULTI_TENANCY=$(yq '.abp.multi_tenancy // false' "$cfg")
     TIERED=$(yq '.abp.tiered // false' "$cfg")
     HETZNER_LOCATION=$(yq '.infra.hetzner_location // "hel1"' "$cfg")
-    HETZNER_SERVER_TYPE=$(yq '.infra.hetzner_server_type // "cx22"' "$cfg")
+    HETZNER_SERVER_TYPE=$(yq '.infra.hetzner_server_type // "cx23"' "$cfg")
     CLOUDFLARE_ZONE=$(yq '.infra.cloudflare_zone // "REPLACE_ME"' "$cfg")
     # Derived cases.
     PROJECT_NAME_LOWER="${PROJECT_NAME,,}"
@@ -252,7 +253,7 @@ phase_load_or_prompt_config() {
         local pn go use_defaults
         pn=$(prompt_text "Project name (PascalCase, e.g. MyApp)" "MyApp")
         go=$(prompt_text "GitHub owner" "codarteinc")
-        use_defaults=$(prompt_yesno "Use defaults for everything else (UI=angular, db=ef/postgresql, infra=hel1/cx22)?" y)
+        use_defaults=$(prompt_yesno "Use defaults for everything else (UI=angular, db=ef/postgresql, infra=hel1/cx23)?" y)
         # Build a minimal YAML; unit-02 will populate the rest from the
         # recommendation engine. cloudflare_zone uses REPLACE_ME so the
         # operator notices before deploy.
@@ -270,7 +271,7 @@ phase_load_or_prompt_config() {
             printf '  optional_modules: []\n'
             printf 'infra:\n'
             printf '  hetzner_location: hel1\n'
-            printf '  hetzner_server_type: cx22\n'
+            printf '  hetzner_server_type: cx23\n'
             printf '  cloudflare_zone: REPLACE_ME\n'
         } > "$tmp"
         if [[ "$use_defaults" != "yes" ]]; then
@@ -753,6 +754,34 @@ phase_apply_docker_overlay() {
     log_ok "overlay-docker applied"
 }
 
+phase_apply_terraform_overlay() {
+    _phase_start "phase_apply_terraform_overlay"
+
+    # Dry-run short-circuit — phase_apply_overlays produced no target tree
+    # under --dry-run / --dry-run-abp-new.
+    if (( DRY_RUN == 1 )) || (( DRY_RUN_ABP_NEW == 1 )); then
+        log_info "[overlay-terraform] dry-run: skipping terraform overlay (no rendered tree)"
+        return 0
+    fi
+
+    if [[ -z "${TARGET_DIR:-}" || ! -d "$TARGET_DIR" ]]; then
+        log_warn "[overlay-terraform] TARGET_DIR not set or missing; skipping"
+        return 0
+    fi
+
+    # shellcheck source=lib/terraform-overlay.sh disable=SC1091
+    source "${LIB_DIR}/terraform-overlay.sh"
+
+    local target_real
+    target_real="$(realpath "$TARGET_DIR")"
+
+    terraform_overlay_render_templated_files "$target_real" || return 1
+    terraform_overlay_install_script_perms "$target_real" || return 1
+    terraform_overlay_splice_gitignore "$target_real" || return 1
+
+    log_ok "overlay-terraform applied"
+}
+
 phase_run_post_init_commands() {
     _phase_start "phase_run_post_init_commands (stub — unit-10)"
     log_info "post-init commands populate here in unit-10"
@@ -781,6 +810,7 @@ main() {
     phase_apply_overlays
     phase_apply_security_overlay
     phase_apply_docker_overlay
+    phase_apply_terraform_overlay
     phase_run_post_init_commands
     phase_github_repo_init
     phase_handoff

@@ -75,7 +75,9 @@ _marker_style_for() {
         # `# </ScaffoldBlock>`. Byte-identical to the csharp style except
         # the leading `#` instead of `//`. Matches *.conf and the unit-06
         # split `*.conf.template` / `*.conf.template.base` filenames.
+        # unit-07 also uses this style for .gitignore (same `#` comment leader).
         *.conf|*.conf.template|*.conf.template.base) echo "nginx"   ;;
+        */.gitignore|.gitignore)           echo "nginx"   ;;
         *)
             log_fail "_marker_style_for: unknown marker style for: $f" \
                 "_marker_style_for"

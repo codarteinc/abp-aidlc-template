@@ -1,0 +1,47 @@
+# terraform.tfvars.example — copy to terraform.tfvars (gitignored) and fill in.
+#
+# IMPORTANT: do NOT put secrets in this file. The `hcloud_token` and
+# `cloudflare_api_token` variables read from `TF_VAR_hcloud_token` /
+# `TF_VAR_cloudflare_api_token` env vars on the apply host. Keep them in
+# your shell environment or your secret manager, never in a .tfvars file
+# (even one that's gitignored — accidents happen, env vars are safer).
+#
+# Quick start:
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#   # edit terraform.tfvars (set ssh_allowed_cidrs + operator_ssh_pubkeys)
+#   export TF_VAR_hcloud_token="hetzner-api-token-from-console"
+#   terraform init
+#   terraform plan
+#   terraform apply
+
+# REQUIRED — list of CIDR blocks allowed to SSH into the VM.
+# Use /32 for single IPs. Get yours from: curl -4 ifconfig.me
+ssh_allowed_cidrs = [
+  # "203.0.113.7/32",     # operator-1 home
+  # "198.51.100.42/32",   # self-hosted runner static IP
+]
+
+# REQUIRED — operator SSH public keys keyed by a stable short name.
+# Each entry is registered as a Hetzner SSH key and injected at server
+# create time.
+operator_ssh_pubkeys = {
+  # "alice-laptop" = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop"
+}
+
+# OPTIONAL — server type. Defaults to the scaffold-config value (~€4/mo for
+# cx23). Bump to cx33 (4 vCPU / 8 GB / 80 GB) once the stack starts swapping
+# under load. (Old cx22/cx32 names were retired by Hetzner in 2026.)
+# server_type = "cx23"
+
+# OPTIONAL — DNS provider. Leave unset (default "none") to manage DNS
+# out-of-band; the module emits sslip.io fallback hostnames. Set to
+# "cloudflare" and populate the four cloudflare_* vars to let Terraform
+# manage the A + AAAA records.
+# dns_provider = "none"
+#
+# # When dns_provider = "cloudflare", uncomment + populate:
+# # cloudflare_zone_id = "0123456789abcdef0123456789abcdef"
+# # app_hostname       = "app.staging.example.com"
+# # api_hostname       = "api.staging.example.com"
+# # (also set TF_VAR_cloudflare_api_token in the shell)

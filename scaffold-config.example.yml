@@ -18,7 +18,7 @@ abp:
 
 infra:
   hetzner_location: hel1
-  hetzner_server_type: cx22
+  hetzner_server_type: cx23
   cloudflare_zone: example.com
 
 # discord_webhook left unset (optional).
