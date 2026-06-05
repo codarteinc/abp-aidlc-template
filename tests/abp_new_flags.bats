@@ -62,8 +62,13 @@ load _helper
 }
 
 @test "ABP version auto-detect picks up local abp --version" {
+    # Skip when abp CLI isn't installed (CI's fast-tier bats job has no
+    # Volo.Abp.Studio.Cli by design — only the slow smoke job does).
+    command -v abp >/dev/null 2>&1 || skip "abp CLI not installed"
     detected="$(abp --version 2>/dev/null | head -1 | awk '{print $NF}')"
     [ -n "$detected" ]
+    # Force auto-detect by unsetting the helper's ABP_VERSION default.
+    unset ABP_VERSION
     run run_scaffold_dry_abp_new
     [ "$status" -eq 0 ]
     echo "$output" | grep -q "abp version: ${detected}"

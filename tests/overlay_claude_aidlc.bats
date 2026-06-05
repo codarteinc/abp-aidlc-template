@@ -74,6 +74,12 @@ _export_fixture_env() {
 }
 
 @test "abp-*/SKILL.md byte-identical to LinkHub source" {
+    # Dev-box-only — the LinkHub source tree at $SKILLS_SRC doesn't exist
+    # on CI runners. The "are these 18 files byte-identical to LinkHub"
+    # check matters during the FIRST scaffold-template bring-up (already
+    # verified by unit-09's reviewer); after that the files in
+    # template/.claude/skills/abp-*/ are the source of truth.
+    [ -d "$SKILLS_SRC" ] || skip "LinkHub source tree not present (CI / non-dev environment)"
     for d in "$SKILLS_SRC"/abp-*; do
         local name; name=$(basename "$d")
         run diff -q "$d/SKILL.md" "$TEMPLATE/.claude/skills/$name/SKILL.md"
