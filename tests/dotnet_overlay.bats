@@ -234,7 +234,7 @@ EOF
     f="${TMP}/program-fixture.cs"
     m="${TMP}/prog.markers"
     cat > "$m" <<'EOF'
-ANCHOR_INLINE ^[[:space:]]*var[[:space:]]+builder[[:space:]]*=[[:space:]]*WebApplication\.CreateBuilder\(args\)
+ANCHOR_INLINE ^[[:space:]]*var[[:space:]]+builder[[:space:]]*=[[:space:]]*WebApplication[.]CreateBuilder[(]args[)]
 BLOCK fwd-headers
 EOF
     run merge_markers_into_existing "$f" "$m"

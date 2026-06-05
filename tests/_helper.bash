@@ -52,7 +52,10 @@ infra:
   hetzner_server_type: cx22
   cloudflare_zone: ${cfg[cloudflare_zone]}
 EOF
-    bash "${SCAFFOLD_ROOT}/scaffold.sh" \
+    # --dry-run-abp-new still needs ABP_VERSION populated to assemble the
+    # flag list. Set a deterministic value so the test runs without a real
+    # `abp` CLI installed (CI's bats job has no abp tool by design).
+    ABP_VERSION="${ABP_VERSION:-10.3.0}" bash "${SCAFFOLD_ROOT}/scaffold.sh" \
         --config "${tmpdir}/c.yml" \
         --target "${tmpdir}/${cfg[project_name]}" \
         --dry-run-abp-new 2>&1

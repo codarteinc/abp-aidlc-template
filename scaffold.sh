@@ -370,6 +370,15 @@ phase_create_target_dir() {
 phase_abp_new() {
     _phase_start "phase_abp_new"
 
+    # Dry-run short-circuit: skip abp invocation AND its prerequisites
+    # (version detection, target-dir realpath) so downstream phases can
+    # still log their dry-run banners on machines without the abp CLI
+    # installed (e.g. the CI bats job).
+    if [[ "${DRY_RUN:-0}" == "1" ]] && [[ "${DRY_RUN_ABP_NEW:-0}" != "1" ]]; then
+        log_info "[abp-new] dry-run: skipping"
+        return 0
+    fi
+
     # ABP version resolution: ABP_VERSION env / --abp-version flag wins.
     # Otherwise autodetect from the locally-installed CLI. The resolved
     # value is exported so unit-10's post-init banner can record it in
