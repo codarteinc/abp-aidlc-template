@@ -50,4 +50,7 @@ for src in "$SRC_DIR"/*.template; do
 done
 
 cd "$TMP"
+# actionlint walks parent dirs looking for .git to root the project.
+# Bootstrap an empty git repo so it can locate .github/workflows.
+git init -q
 actionlint -ignore '"on" section'

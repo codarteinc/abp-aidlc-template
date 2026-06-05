@@ -48,20 +48,28 @@ export HETZNER_SERVER_TYPE=cx23
 export CLOUDFLARE_ZONE=example.com
 
 # Walk the tree, envsubst .tf/.tfvars files, copy everything else verbatim.
+# Path components with the `{{PROJECTNAME}}` token (e.g.
+# `modules/{{PROJECTNAME}}-env/`) get substituted at copy time too so
+# `module "x" { source = "../modules/SmokeApp-env" }` references resolve.
 cd "$SRC_DIR"
 while IFS= read -r -d '' src; do
     rel="${src#./}"
-    dest="$TMP/$rel"
+    # Substitute {{PROJECTNAME}} → $PROJECT_NAME in the destination path.
+    rel_subst="${rel//\{\{PROJECTNAME\}\}/$PROJECT_NAME}"
+    dest="$TMP/$rel_subst"
     mkdir -p "$(dirname "$dest")"
     case "$rel" in
-        *.tf|*.tfvars|*.hcl|*.tftpl|*.tf.template|*.tfvars.template)
+        *.tf|*.tfvars|*.hcl|*.tftpl|*.tf.template|*.tfvars.template|*.tf.tmpl|*.tfvars.tmpl)
             # shellcheck disable=SC2016
             envsubst '${PROJECT_NAME} ${PROJECT_NAME_LOWER} ${PROJECTNAME_UPPER} ${GITHUB_OWNER} ${HCP_ORG} ${HETZNER_LOCATION} ${HETZNER_SERVER_TYPE} ${CLOUDFLARE_ZONE}' \
                 < "$src" > "$dest"
-            # Drop a stray .template suffix once substituted.
+            # Drop a stray .template or .tmpl suffix once substituted.
             case "$dest" in
                 *.template)
                     mv "$dest" "${dest%.template}"
+                    ;;
+                *.tmpl)
+                    mv "$dest" "${dest%.tmpl}"
                     ;;
             esac
             ;;

@@ -17,14 +17,23 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Run shellcheck
-        run: shellcheck scaffold.sh lib/*.sh scripts/*.sh
+        # --severity=warning matches the per-unit verification gate; info-level
+        # SC2016 in scripts/smoke-abp-new.sh is intentional (literal token).
+        run: shellcheck --severity=warning scaffold.sh lib/*.sh scripts/*.sh
 
   bats:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install bats
-        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Install bats + gawk
+        # gawk is required: mawk (Ubuntu default) treats `\[` `\]` `\(` `\)`
+        # as plain chars in regex, breaking the marker-pair ANCHOR patterns
+        # in dotnet-overlay.sh. gawk honors POSIX BRE escape semantics.
+        # `update-alternatives --set awk /usr/bin/gawk` ensures bare `awk`
+        # invocations in lib/ scripts resolve to gawk.
+        run: |
+          sudo apt-get update && sudo apt-get install -y bats gawk
+          sudo update-alternatives --set awk /usr/bin/gawk
       - name: Run bats fast tier
         # Only the top-level tests/ glob — explicitly excludes tests/smoke/
         # which is gated behind RUN_SMOKE_TESTS=1 in the smoke job below.

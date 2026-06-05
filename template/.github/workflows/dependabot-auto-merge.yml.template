@@ -178,10 +178,12 @@ jobs:
           else
             UPDATE_TYPE="semver-patch"
           fi
-          echo "update-type=${UPDATE_TYPE}" >> "$GITHUB_OUTPUT"
-          echo "from-version=${FROM_VER}" >> "$GITHUB_OUTPUT"
-          echo "to-version=${TO_VER}" >> "$GITHUB_OUTPUT"
-          echo "skip=" >> "$GITHUB_OUTPUT"
+          {
+            echo "update-type=${UPDATE_TYPE}"
+            echo "from-version=${FROM_VER}"
+            echo "to-version=${TO_VER}"
+            echo "skip="
+          } >> "$GITHUB_OUTPUT"
 
       - name: Approve and merge
         if: steps.pr.outputs.number != '' && steps.meta.outputs.skip == ''
