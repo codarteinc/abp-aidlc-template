@@ -26,14 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install bats + gawk
-        # gawk is required: mawk (Ubuntu default) treats `\[` `\]` `\(` `\)`
-        # as plain chars in regex, breaking the marker-pair ANCHOR patterns
-        # in dotnet-overlay.sh. gawk honors POSIX BRE escape semantics.
-        # `update-alternatives --set awk /usr/bin/gawk` ensures bare `awk`
-        # invocations in lib/ scripts resolve to gawk.
-        run: |
-          sudo apt-get update && sudo apt-get install -y bats gawk
-          sudo update-alternatives --set awk /usr/bin/gawk
+        # gawk is required: lib/dotnet-overlay.sh prefers it via LH_AWK
+        # because Ubuntu's default mawk treats `\[` `\]` `\(` `\)` as plain
+        # chars in regex (silent warnings), breaking the marker ANCHOR
+        # patterns in the *.markers files.
+        run: sudo apt-get update && sudo apt-get install -y bats gawk
       - name: Run bats fast tier
         # Only the top-level tests/ glob — explicitly excludes tests/smoke/
         # which is gated behind RUN_SMOKE_TESTS=1 in the smoke job below.

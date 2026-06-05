@@ -60,6 +60,21 @@ if [[ -z "${__LH_LOG_SH_SOURCED:-}" ]]; then
     source "$(dirname "${BASH_SOURCE[0]}")/log.sh"
 fi
 
+# Prefer gawk over mawk for marker-anchor regex evaluation.
+# Why: Ubuntu's default mawk treats backslash-escapes for regex metachars
+# (`\[`, `\]`, `\(`, `\)`) as plain chars and emits "treated as plain X"
+# warnings, which silently breaks the ANCHOR patterns in the markers
+# files (e.g. `Main\(string\[\][[:space:]]+args\)`). gawk honors POSIX
+# BRE escape semantics. Falls back to plain `awk` only if gawk is
+# missing — most distros ship gawk by default; mawk-only environments
+# need the markers anchors rewritten with bracket-class form (e.g. `[(]`
+# instead of `\(`).
+if command -v gawk >/dev/null 2>&1; then
+    LH_AWK="gawk"
+else
+    LH_AWK="awk"
+fi
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -163,7 +178,7 @@ _insert_empty_marker_pair() {
     esac
 
     local tmp="${file}.scaffold-marker.tmp"
-    awk -v anchor="$anchor" -v ol="$open_line" -v cl="$close_line" \
+    "$LH_AWK" -v anchor="$anchor" -v ol="$open_line" -v cl="$close_line" \
         -v after_brace="$after_brace" '
         BEGIN { state = 0; anchor_indent = "    " }
         # state 0 = looking for anchor
@@ -237,7 +252,7 @@ scaffold_insert_block() {
     close=$(_marker_close_pattern "$style" "$name") || return 1
 
     local tmp="${file}.scaffold-insert.tmp"
-    awk -v op="$open" -v cp="$close" -v body_file="$content_file" '
+    "$LH_AWK" -v op="$open" -v cp="$close" -v body_file="$content_file" '
         BEGIN { inside = 0; matched = 0 }
         {
             if (!inside && index($0, op) > 0) {
@@ -410,7 +425,7 @@ dotnet_overlay_set_root_namespace() {
     # Insert-path: inject just before </PropertyGroup> of the FIRST
     # <PropertyGroup> that contains a <TargetFramework>.
     local tmp="${csproj}.rootns.tmp"
-    awk -v ns="$ns" '
+    "$LH_AWK" -v ns="$ns" '
         function capture_indent(line,    s) {
             # POSIX awk: 2-arg match() sets RSTART/RLENGTH.
             if (match(line, /^[ \t]+/)) {
@@ -521,7 +536,7 @@ _csproj_add_packageref() {
     local tmp="${csproj}.pkgref.tmp"
     # Try to inject into the first ItemGroup with a PackageReference
     # already in it.
-    awk -v pkg="$pkg" -v ver="$ver" '
+    "$LH_AWK" -v pkg="$pkg" -v ver="$ver" '
         function capture_indent(line) {
             if (match(line, /^[ \t]+/)) {
                 return substr(line, RSTART, RLENGTH)
@@ -568,7 +583,7 @@ _csproj_add_packageref() {
 
     if ! grep -qE "Include=\"${pkg}\"" "$tmp"; then
         # No suitable ItemGroup found — create one before </Project>.
-        awk -v pkg="$pkg" -v ver="$ver" '
+        "$LH_AWK" -v pkg="$pkg" -v ver="$ver" '
             BEGIN { inserted = 0 }
             /<\/Project>/ && !inserted {
                 print ""
@@ -640,7 +655,7 @@ dotnet_overlay_add_dependson_attribute() {
     fi
 
     local tmp="${cs}.dependson.tmp"
-    awk -v new_type="typeof(${module_class})" '
+    "$LH_AWK" -v new_type="typeof(${module_class})" '
         BEGIN { found_open = 0; injected = 0 }
         {
             line = $0
@@ -709,7 +724,7 @@ _ensure_using_line() {
         return 0
     fi
     local tmp="${cs}.using.tmp"
-    awk -v new="$using_line" '
+    "$LH_AWK" -v new="$using_line" '
         BEGIN { inserted = 0; last_using = 0 }
         /^using[[:space:]]+[A-Za-z]/ {
             last_using = NR
