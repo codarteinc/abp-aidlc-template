@@ -4,5 +4,5 @@
 # fail-fast block must run BEFORE the actual seeding kicks off so the
 # process aborts early when App:AdminPassword is unset or matches a
 # known-leaked plaintext.
-ANCHOR ^[[:space:]]*private[[:space:]]+async[[:space:]]+Task[[:space:]]+SeedDataAsync\(\)[[:space:]]*$
+ANCHOR ^[[:space:]]*private[[:space:]]+async[[:space:]]+Task[[:space:]]+SeedDataAsync[(][)][[:space:]]*$
 BLOCK admin-password-fail-fast

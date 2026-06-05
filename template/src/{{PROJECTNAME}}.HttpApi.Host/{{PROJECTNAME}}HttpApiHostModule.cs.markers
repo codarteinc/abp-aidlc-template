@@ -9,7 +9,7 @@
 # OTel + Prometheus + health-endpoint service registration (unit-04).
 # unit-04 owns: otel, health-endpoints.
 # unit-05 owns: secrets-json-loader.
-ANCHOR ^[[:space:]]*public override void ConfigureServices\(.*\)[[:space:]]*$
+ANCHOR ^[[:space:]]*public override void ConfigureServices[(].*[)][[:space:]]*$
 BLOCK secrets-json-loader
 BLOCK otel
 BLOCK health-endpoints
@@ -18,7 +18,7 @@ BLOCK health-endpoints
 # unit-05 owns: csp-middleware, hsts, openiddict-cert (placement of the
 # openiddict-cert block may move to PreConfigureServices per unit-05's
 # spec — unit-05 builder owns that re-anchor; unit-04 leaves it here).
-ANCHOR ^[[:space:]]*public override void OnApplicationInitialization\(.*\)[[:space:]]*$
+ANCHOR ^[[:space:]]*public override void OnApplicationInitialization[(].*[)][[:space:]]*$
 BLOCK csp-middleware
 BLOCK hsts
 
@@ -27,5 +27,5 @@ BLOCK hsts
 # so the OpenIddict server picks up the operator-supplied cert in
 # non-Development environments. Unit-05 ownership; see overlay-blocks/
 # unit-05/module-openiddict-cert.cs for the body.
-ANCHOR ^[[:space:]]*public override void PreConfigureServices\(.*\)[[:space:]]*$
+ANCHOR ^[[:space:]]*public override void PreConfigureServices[(].*[)][[:space:]]*$
 BLOCK openiddict-cert
